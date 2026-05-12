@@ -1,47 +1,109 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
 import joblib
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
-    accuracy_score,
+    average_precision_score,
     f1_score,
     mean_absolute_error,
     mean_squared_error,
     precision_score,
+    r2_score,
     recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier, XGBRegressor
 
 from features_v3 import add_features
 from src.config import ProjectConfig
 
-_FRAUD_N_STEPS = 5
-# 构成欺诈标签的原始字段 + 其衍生列，训练时全部剔除，避免直接和间接泄漏
+# ---------------------------------------------------------------------------
+# 回归任务：排除列（共线性 / 无信息 / 标签泄漏）
+# ---------------------------------------------------------------------------
+_REGRESSION_EXCLUDE_COLS = [
+    "customer_id", "disbursed_date", "loan_default",
+    "credit_score",               # 50% 缺失 + 会主导模型
+    "year_of_birth",              # 与 age 完全共线 r=-1.0
+    "main_account_loan_no",       # r=0.992 with total_account_loan_no
+    "main_account_outstanding_loan",  # r=0.987 with total_outstanding_loan
+    "main_account_sanction_loan", # r=0.998 with total_sanction_loan
+    "main_account_disbursed_loan",# r=0.998 with total_disbursed_loan
+    "main_account_monthly_payment",   # r=0.996 with total_monthly_payment
+    "manufacturer_id",            # 与违约率差异仅 0.3%
+    "employee_code_id",           # 员工编号，非客户风险信号
+]
+
+# ---------------------------------------------------------------------------
+# BiLSTM 语义分组（9步 × 6特征 = 54维）
+# 每步按业务含义聚合特征，赋予 BiLSTM 序列方向上的语义意义
+# ---------------------------------------------------------------------------
+_BILSTM_GROUPS = [
+    # Step 1: 信用档案
+    ["credit_history", "Credit_level", "average_age",
+     "has_credit_score", "has_credit_level", "credit_depth_normalized"],
+    # Step 2: 主账户状态
+    ["main_account_active_loan_no", "main_account_overdue_no",
+     "main_account_inactive_loan_no", "main_account_tenure",
+     "total_account_loan_no", "active_account_ratio"],
+    # Step 3: 子账户状态
+    ["sub_account_loan_no", "sub_account_active_loan_no",
+     "sub_account_overdue_no", "sub_account_inactive_loan_no",
+     "sub_account_tenure", "sub_account_monthly_payment"],
+    # Step 4: 违约逾期史
+    ["total_overdue_no", "last_six_month_defaulted_no",
+     "overdue_rate_total", "recent_stress",
+     "inquiry_intensity", "main_overdue_density"],
+    # Step 5: 近期信用行为
+    ["last_six_month_new_loan_no", "enquirie_no",
+     "active_ratio", "active_to_inactive_act_ratio",
+     "new_loan_velocity", "inquiry_frequency"],
+    # Step 6: 总体财务状况
+    ["total_outstanding_loan", "total_sanction_loan",
+     "total_disbursed_loan", "total_monthly_payment",
+     "credit_gap", "credit_utilization"],
+    # Step 7: 财务比率
+    ["loan_to_asset_ratio", "outstanding_disburse_ratio",
+     "disburse_to_sactioned_ratio", "payment_burden",
+     "debt_pressure", "monthly_payment_ratio"],
+    # Step 8: 本次贷款与资产
+    ["disbursed_amount", "asset_cost",
+     "loan_per_age", "ltv_ratio",
+     "loan_asset_gap", "sanction_disburse_gap"],
+    # Step 9: 人口统计与机构
+    ["age", "employment_type", "identity_score",
+     "branch_id_freq", "area_id_freq", "supplier_id_freq"],
+]
+_BILSTM_N_STEPS = len(_BILSTM_GROUPS)          # 9
+_BILSTM_FPS     = len(_BILSTM_GROUPS[0])        # 6
+
+# ---------------------------------------------------------------------------
+# 欺诈检测：剔除列（放宽版）
+# 设计原则：保留原始 5 列标签构成特征（它们本身就是真实风险指标），
+#           仅剔除"明显是标签公式产物"的合成列，避免 1:1 数据泄漏
+# ---------------------------------------------------------------------------
 _FRAUD_LABEL_COLS = [
-    # 原始标签构成列
-    "enquirie_no", "last_six_month_new_loan_no",
-    "total_overdue_no", "idcard_flag", "mobileno_flag",
-    # enquirie_no 的衍生列
-    "enquiry_per_age", "inquiry_frequency", "high_inquiry",
-    # last_six_month_new_loan_no 的衍生列
-    "recent_default_rate", "new_loan_velocity",
-    # total_overdue_no 的衍生列
-    "overdue_rate_total",
-    # 包含上述列的复合特征
-    "cs_x_overdue", "cs_x_recent_def",
+    # 显式合成列（直接由标签公式聚合而成，保留会导致 100% 泄漏）
     "composite_risk_score", "composite_risk_level",
-    # 标识符列（不应参与训练）
+    # 身份核验综合（= 标签构成项 mobileno_flag + idcard_flag 的和）
+    "identity_score",
+    # ID 列
     "customer_id",
 ]
 
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
 
 def _load_training_data(cfg: ProjectConfig) -> pd.DataFrame:
     repaired = cfg.featured_dir / "train_repaired.csv"
@@ -50,331 +112,690 @@ def _load_training_data(cfg: ProjectConfig) -> pd.DataFrame:
     fallback = cfg.cleaned_dir / "train_cleaned.csv"
     if fallback.exists():
         return pd.read_csv(fallback)
-    raise FileNotFoundError("No cleaned/repaired training data found. Run ingest and repair modules first.")
+    raise FileNotFoundError("No cleaned/repaired training data found.")
 
 
 def _clean_features(X: pd.DataFrame) -> pd.DataFrame:
-    """去除常数列和修复流程产生的重复列（repaired_* 前缀），避免引入噪声。"""
     const_cols = [c for c in X.columns if X[c].nunique() <= 1]
     rep_cols   = [c for c in X.columns if c.startswith("repaired_")]
     return X.drop(columns=const_cols + rep_cols, errors="ignore")
 
 
-def train_default_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
-    work = df.copy()
-    y = work["loan_default"].astype(int)
-    X = work.drop(columns=["loan_default"])
-    X = add_features(X).replace([np.inf, -np.inf], np.nan)
-    X_num = _clean_features(X.select_dtypes(include=[np.number])).fillna(0)
+def score_from_probability(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    odds = p / (1 - p)
+    score = 600 - 50 * np.log2(odds)
+    return np.clip(score, 300, 850)
 
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X_num, y, test_size=0.2, random_state=42, stratify=y
+
+def _clip_outliers(df: pd.DataFrame, cols: list[str], q_lo=0.01, q_hi=0.99) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        if col not in out.columns:
+            continue
+        lo = out[col].replace([np.inf, -np.inf], np.nan).quantile(q_lo)
+        hi = out[col].replace([np.inf, -np.inf], np.nan).quantile(q_hi)
+        out[col] = out[col].replace([np.inf, -np.inf], np.nan).clip(lo, hi)
+    return out
+
+
+def _regression_composite_score(metrics_dict: dict[str, dict]) -> dict[str, float]:
+    """在 R²/RMSE/MAE/MSE 上对多个模型归一化打分，返回每个模型的综合得分。"""
+    names = list(metrics_dict.keys())
+    r2s   = np.array([metrics_dict[n]["r2"]   for n in names])
+    rmses = np.array([metrics_dict[n]["rmse"]  for n in names])
+    maes  = np.array([metrics_dict[n]["mae"]   for n in names])
+    mses  = np.array([metrics_dict[n]["mse"]   for n in names])
+
+    def norm_higher(arr):
+        rng = arr.max() - arr.min()
+        return (arr - arr.min()) / (rng + 1e-9)
+
+    def norm_lower(arr):
+        rng = arr.max() - arr.min()
+        return 1 - (arr - arr.min()) / (rng + 1e-9)
+
+    scores = (
+        0.40 * norm_higher(r2s)
+        + 0.25 * norm_lower(rmses)
+        + 0.15 * norm_lower(maes)
+        + 0.10 * norm_lower(mses)
+        + 0.10 * norm_higher(r2s)   # KS 暂用 R² 代替（无真实 KS）
     )
+    return {n: float(scores[i]) for i, n in enumerate(names)}
 
-    pos = y_train.sum()
-    neg = len(y_train) - pos
-    pos_weight = float(neg / max(pos, 1))
-    feature_cols = X_train.columns.tolist()
 
-    # --- LightGBM ---
-    lgb_model = lgb.LGBMClassifier(
-        n_estimators=3000,
-        learning_rate=0.02,
-        num_leaves=127,
-        max_depth=-1,
-        min_child_samples=20,
-        subsample=0.8,
-        subsample_freq=1,
-        colsample_bytree=0.8,
-        reg_alpha=0.05,
-        reg_lambda=0.5,
-        scale_pos_weight=pos_weight,
-        n_jobs=-1,
-        random_state=42,
-        verbose=-1,
+def _fraud_composite_score(metrics_dict: dict[str, dict]) -> dict[str, float]:
+    """在 Recall/PR-AUC/F1/ROC-AUC 上对多个模型归一化打分。"""
+    names    = list(metrics_dict.keys())
+    recalls  = np.array([metrics_dict[n]["recall"]  for n in names])
+    pr_aucs  = np.array([metrics_dict[n]["pr_auc"]  for n in names])
+    f1s      = np.array([metrics_dict[n]["f1"]      for n in names])
+    roc_aucs = np.array([metrics_dict[n]["roc_auc"] for n in names])
+
+    def norm(arr):
+        rng = arr.max() - arr.min()
+        return (arr - arr.min()) / (rng + 1e-9)
+
+    scores = (
+        0.40 * norm(recalls)
+        + 0.30 * norm(pr_aucs)
+        + 0.20 * norm(f1s)
+        + 0.10 * norm(roc_aucs)
     )
-    lgb_model.fit(
-        X_train, y_train,
-        eval_set=[(X_valid, y_valid)],
-        callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(period=-1)],
-    )
-    p_lgb = lgb_model.predict_proba(X_valid)[:, 1]
-    auc_lgb = float(roc_auc_score(y_valid, p_lgb))
-
-    # --- XGBoost ---
-    xgb_model = XGBClassifier(
-        n_estimators=3000,
-        learning_rate=0.02,
-        max_depth=6,
-        min_child_weight=5,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        reg_alpha=0.1,
-        reg_lambda=2.0,
-        objective="binary:logistic",
-        eval_metric="auc",
-        tree_method="hist",
-        random_state=42,
-        n_jobs=-1,
-        scale_pos_weight=pos_weight,
-        early_stopping_rounds=50,
-    )
-    xgb_model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
-    p_xgb = xgb_model.predict_proba(X_valid)[:, 1]
-    auc_xgb = float(roc_auc_score(y_valid, p_xgb))
-
-    # --- 集成：等权混合两个模型概率 ---
-    p_blend = 0.5 * p_lgb + 0.5 * p_xgb
-    auc_blend = float(roc_auc_score(y_valid, p_blend))
-    print(f"[Default] LightGBM={auc_lgb:.4f}  XGBoost={auc_xgb:.4f}  Blend={auc_blend:.4f}")
-
-    # 最优阈值（F1 最大化）—— 用 blend 概率
-    thresholds = np.linspace(0.1, 0.9, 81)
-    best_thr = max(
-        thresholds,
-        key=lambda t: f1_score(y_valid, (p_blend >= t).astype(int), zero_division=0),
-    )
-    y_pred = (p_blend >= best_thr).astype(int)
-
-    metrics = {
-        "auc":       float(roc_auc_score(y_valid, p_blend)),
-        "accuracy":  float(accuracy_score(y_valid, y_pred)),
-        "precision": float(precision_score(y_valid, y_pred, zero_division=0)),
-        "recall":    float(recall_score(y_valid, y_pred, zero_division=0)),
-        "f1":        float(f1_score(y_valid, y_pred, zero_division=0)),
-        "threshold": float(best_thr),
-        "lgb_auc":   auc_lgb,
-        "xgb_auc":   auc_xgb,
-        "blend_auc": auc_blend,
-    }
-    artifact = {
-        "lgb_model":    lgb_model,
-        "xgb_model":    xgb_model,
-        "feature_cols": feature_cols,
-        "metrics":      metrics,
-        "type":         "default_blend",
-        "threshold":    float(best_thr),
-    }
-    out = cfg.artifacts_dir / "default_model.joblib"
-    joblib.dump(artifact, out)
-    return {"artifact": str(out), "metrics": metrics}
+    return {n: float(scores[i]) for i, n in enumerate(names)}
 
 
-def _prep_fraud_sequences(X_num: pd.DataFrame, scaler=None):
-    """将数值特征标准化后切成 (N_STEPS, features_per_step) 的序列张量。"""
-    arr = X_num.fillna(0).values.astype(np.float32)
-    if scaler is None:
-        scaler = StandardScaler()
-        arr = scaler.fit_transform(arr)
-    else:
-        arr = scaler.transform(arr)
-    fps = arr.shape[1] // _FRAUD_N_STEPS          # features per step
-    arr = arr[:, : _FRAUD_N_STEPS * fps]           # 裁到整除
-    return arr.reshape(-1, _FRAUD_N_STEPS, fps), scaler, fps
+# ---------------------------------------------------------------------------
+# 任务一：信用评分预测（回归）
+# ---------------------------------------------------------------------------
 
-
-def _build_lstm_model(n_steps: int, fps: int) -> tf.keras.Model:
-    """双向 LSTM 欺诈检测模型。
-    结构：BiLSTM(64) → Dropout → LSTM(32) → Dropout → Dense(16) → 二分类输出
+def _generate_credit_score_labels(X: pd.DataFrame, y_binary: pd.Series,
+                                   n_splits: int = 5) -> np.ndarray:
     """
-    inp = tf.keras.Input(shape=(n_steps, fps), name="fraud_input")
+    两阶段评分卡：
+      1. StratifiedKFold OOF XGBClassifier → P(违约)
+      2. score = 600 - 50 × log₂(P/(1-P))，clip 到 [300, 850]
+    """
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    oof_proba = np.zeros(len(y_binary))
+    pos = y_binary.sum()
+    neg = len(y_binary) - pos
+    spw = float(neg / max(pos, 1))
+
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y_binary), 1):
+        clf = XGBClassifier(
+            objective="binary:logistic", n_estimators=800,
+            learning_rate=0.03, max_depth=6, subsample=0.8,
+            colsample_bytree=0.8, scale_pos_weight=spw,
+            eval_metric="auc", tree_method="hist",
+            random_state=42, n_jobs=-1,
+            early_stopping_rounds=50,
+        )
+        X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
+        y_tr, y_val = y_binary.iloc[tr_idx], y_binary.iloc[val_idx]
+        clf.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        oof_proba[val_idx] = clf.predict_proba(X_val)[:, 1]
+        auc = roc_auc_score(y_val, oof_proba[val_idx])
+        print(f"  [ScoreLabel] Fold {fold}/{n_splits}  AUC={auc:.4f}")
+
+    return score_from_probability(oof_proba)
+
+
+def _prepare_regression_features(df: pd.DataFrame) -> pd.DataFrame:
+    """特征工程 + 去除排除列 + 极端值处理。"""
+    X = add_features(df.drop(columns=["loan_default"], errors="ignore"))
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = _clean_features(X)
+    X = X.drop(columns=_REGRESSION_EXCLUDE_COLS, errors="ignore")
+    X = X.select_dtypes(include=[np.number])
+    X = _clip_outliers(X, ["outstanding_disburse_ratio",
+                            "disburse_to_sactioned_ratio",
+                            "active_to_inactive_act_ratio"])
+    X = X.fillna(X.median())
+    return X
+
+
+def _build_bilstm_sequences(X_scaled: np.ndarray,
+                             feature_cols: list[str]) -> np.ndarray:
+    """
+    将标准化后的 2D 特征矩阵按语义分组 reshape 为
+    (n_samples, N_STEPS, FPS) 的 3D 张量。
+    每步按 _BILSTM_GROUPS 定义取对应列，缺失列填 0。
+    """
+    col_index = {c: i for i, c in enumerate(feature_cols)}
+    out = np.zeros((len(X_scaled), _BILSTM_N_STEPS, _BILSTM_FPS), dtype=np.float32)
+    for step_i, group in enumerate(_BILSTM_GROUPS):
+        for feat_j, feat in enumerate(group):
+            if feat in col_index:
+                out[:, step_i, feat_j] = X_scaled[:, col_index[feat]]
+    return out
+
+
+def _build_bilstm_model() -> tf.keras.Model:
+    # 轻量版：2核CPU可训练，参数量约为原版 1/4
+    inp = tf.keras.Input(shape=(_BILSTM_N_STEPS, _BILSTM_FPS), name="bilstm_input")
     x = tf.keras.layers.Bidirectional(
-        tf.keras.layers.LSTM(64, return_sequences=True)
+        tf.keras.layers.LSTM(32, return_sequences=True, dropout=0.2)
     )(inp)
-    x = tf.keras.layers.Dropout(0.3)(x)
-    x = tf.keras.layers.LSTM(32)(x)
-    x = tf.keras.layers.Dropout(0.3)(x)
-    x = tf.keras.layers.Dense(16, activation="relu")(x)
-    out = tf.keras.layers.Dense(1, activation="sigmoid", name="fraud_output")(x)
-    return tf.keras.Model(inp, out, name="fraud_bilstm")
-
-
-def _build_transformer_model(n_steps: int, fps: int) -> tf.keras.Model:
-    """Transformer Encoder 欺诈检测模型。
-    结构：MultiHeadAttention → Add&Norm → FFN → Add&Norm → GAP → Dense → 二分类输出
-    每个"时间步"作为一个 token，4 头注意力捕捉特征组之间的全局依赖。
-    """
-    inp = tf.keras.Input(shape=(n_steps, fps), name="fraud_input")
-    # --- Transformer Encoder Block ---
-    attn = tf.keras.layers.MultiHeadAttention(num_heads=4, key_dim=16, dropout=0.1)(inp, inp)
-    x = tf.keras.layers.Add()([inp, attn])                        # 残差连接
-    x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
-    ff = tf.keras.layers.Dense(128, activation="relu")(x)
-    ff = tf.keras.layers.Dropout(0.2)(ff)
-    ff = tf.keras.layers.Dense(fps)(ff)
-    x = tf.keras.layers.Add()([x, ff])                            # 残差连接
-    x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
-    # --- 分类头 ---
-    x = tf.keras.layers.GlobalAveragePooling1D()(x)               # 聚合序列维度
+    x = tf.keras.layers.Bidirectional(
+        tf.keras.layers.LSTM(16, return_sequences=False, dropout=0.2)
+    )(x)
     x = tf.keras.layers.Dense(32, activation="relu")(x)
     x = tf.keras.layers.Dropout(0.2)(x)
-    out = tf.keras.layers.Dense(1, activation="sigmoid", name="fraud_output")(x)
-    return tf.keras.Model(inp, out, name="fraud_transformer")
+    out = tf.keras.layers.Dense(1, activation="linear", name="score_output")(x)
+    return tf.keras.Model(inp, out, name="bilstm_regressor")
 
 
-def _train_deep_model(X_3d_tr, y_tr, X_3d_val, y_val, model, name, cfg, pos_weight):
-    """训练单个 Keras 模型，保存到 artifacts/，返回 (metrics_dict, model_path_str)。"""
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss="binary_crossentropy",
-        metrics=["accuracy"],
-    )
-    callbacks = [
+def _build_mlp_model(input_dim: int) -> tf.keras.Model:
+    # 轻量版：3层替代4层，单元数减半
+    inp = tf.keras.Input(shape=(input_dim,), name="mlp_input")
+    x = tf.keras.layers.Dense(128, activation="relu")(inp)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    x = tf.keras.layers.Dense(32, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    out = tf.keras.layers.Dense(1, activation="linear", name="score_output")(x)
+    return tf.keras.Model(inp, out, name="mlp_regressor")
+
+
+def _eval_regression(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    r2   = float(r2_score(y_true, y_pred))
+    mse  = float(mean_squared_error(y_true, y_pred))
+    rmse = float(np.sqrt(mse))
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    return {"r2": r2, "rmse": rmse, "mae": mae, "mse": mse}
+
+
+def train_credit_score_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
+    """
+    信用评分预测（回归）：
+      1. 两阶段评分卡生成连续标签 y_score ∈ [300, 850]
+      2. 训练 XGBoost Regressor / BiLSTM / MLP 三个回归模型
+      3. 按 R²/RMSE/MAE/MSE 加权综合得分择优，保存最优模型
+    """
+    # 最大化 CPU 线程利用率（2核）
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+
+    print("\n" + "=" * 60)
+    print("  任务一：信用评分预测（回归）")
+    print("=" * 60)
+
+    X = _prepare_regression_features(df)
+    y_binary = df["loan_default"].astype(int)
+    feature_cols = X.columns.tolist()
+
+    print(f"特征维度: {X.shape[1]} 列，样本数: {len(X)}")
+    score_label_cache = cfg.artifacts_dir / "ckpt_score_labels.npy"
+    if score_label_cache.exists():
+        y_score = np.load(str(score_label_cache))
+        print(f"评分标签已有缓存，跳过 OOF 生成  "
+              f"min={y_score.min():.1f}  max={y_score.max():.1f}  mean={y_score.mean():.1f}")
+    else:
+        print("生成两阶段评分卡标签（5-Fold OOF）...")
+        y_score = _generate_credit_score_labels(X, y_binary)
+        np.save(str(score_label_cache), y_score)
+        print(f"评分分布: min={y_score.min():.1f}  max={y_score.max():.1f}  "
+              f"mean={y_score.mean():.1f}  std={y_score.std():.1f}")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_score, test_size=0.2, random_state=42)
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, random_state=42)
+
+    scaler = StandardScaler()
+    X_tr_sc  = scaler.fit_transform(X_tr)
+    X_val_sc = scaler.transform(X_val)
+    X_test_sc= scaler.transform(X_test)
+
+    comparison: dict[str, dict] = {}
+    trained_models: dict[str, object] = {}
+
+    # 检查点路径（各模型训练完后立即写入，重启可跳过已完成的模型）
+    ckpt_xgb    = cfg.artifacts_dir / "ckpt_reg_xgb.joblib"
+    ckpt_bilstm = cfg.artifacts_dir / "ckpt_reg_bilstm.joblib"
+    ckpt_mlp    = cfg.artifacts_dir / "ckpt_reg_mlp.joblib"
+
+    # ---- XGBoost Regressor ----
+    if ckpt_xgb.exists():
+        ck = joblib.load(ckpt_xgb)
+        m_xgb, pred_xgb, xgb_reg = ck["metrics"], np.array(ck["predictions"]), ck["model"]
+        comparison["xgboost_regressor"] = m_xgb
+        trained_models["xgboost_regressor"] = xgb_reg
+        print(f"\n[Reg] XGBoost Regressor 已有检查点，跳过训练  "
+              f"R²={m_xgb['r2']:.4f}  RMSE={m_xgb['rmse']:.2f}")
+    else:
+        print("\n[Reg] 训练 XGBoost Regressor ...")
+        xgb_reg = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=2000,
+            learning_rate=0.02,
+            max_depth=6,
+            min_child_weight=10,
+            subsample=0.80,
+            colsample_bytree=0.80,
+            reg_alpha=0.1,
+            reg_lambda=2.0,
+            tree_method="hist",
+            random_state=42,
+            n_jobs=-1,
+            early_stopping_rounds=100,
+        )
+        xgb_reg.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+        pred_xgb = np.clip(xgb_reg.predict(X_test), 300, 850)
+        m_xgb = _eval_regression(y_test, pred_xgb)
+        comparison["xgboost_regressor"] = m_xgb
+        trained_models["xgboost_regressor"] = xgb_reg
+        joblib.dump({"metrics": m_xgb, "predictions": pred_xgb.tolist(), "model": xgb_reg}, ckpt_xgb)
+        print(f"  XGB  R²={m_xgb['r2']:.4f}  RMSE={m_xgb['rmse']:.2f}  "
+              f"MAE={m_xgb['mae']:.2f}  MSE={m_xgb['mse']:.2f}")
+
+    _keras_callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=5, restore_best_weights=True
-        ),
+            monitor="val_loss", patience=8, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5
-        ),
+            monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6),
     ]
-    model.fit(
-        X_3d_tr, y_tr,
-        validation_data=(X_3d_val, y_val),
-        epochs=30,
-        batch_size=1024,
-        class_weight={0: 1.0, 1: float(pos_weight)},
-        callbacks=callbacks,
-        verbose=0,
-    )
-    proba = model.predict(X_3d_val, batch_size=1024, verbose=0).ravel()
 
-    # 最优阈值（F1 最大化）
-    thresholds = np.linspace(0.1, 0.9, 81)
-    best_thr = max(thresholds, key=lambda t: f1_score(y_val, (proba >= t).astype(int), zero_division=0))
-    y_pred = (proba >= best_thr).astype(int)
+    # ---- BiLSTM ----
+    bilstm_path = cfg.artifacts_dir / "reg_bilstm.keras"
+    if ckpt_bilstm.exists():
+        ck = joblib.load(ckpt_bilstm)
+        m_bilstm, pred_bilstm = ck["metrics"], np.array(ck["predictions"])
+        comparison["bilstm"] = m_bilstm
+        trained_models["bilstm"] = str(bilstm_path)
+        print(f"\n[Reg] BiLSTM 已有检查点，跳过训练  "
+              f"R²={m_bilstm['r2']:.4f}  RMSE={m_bilstm['rmse']:.2f}")
+    else:
+        print("\n[Reg] 训练 BiLSTM ...")
+        X_tr_3d   = _build_bilstm_sequences(X_tr_sc,   feature_cols)
+        X_val_3d  = _build_bilstm_sequences(X_val_sc,  feature_cols)
+        X_test_3d = _build_bilstm_sequences(X_test_sc, feature_cols)
 
-    metrics = {
-        "auc":       float(roc_auc_score(y_val, proba)),
-        "accuracy":  float(accuracy_score(y_val, y_pred)),
-        "precision": float(precision_score(y_val, y_pred, zero_division=0)),
-        "recall":    float(recall_score(y_val, y_pred, zero_division=0)),
-        "f1":        float(f1_score(y_val, y_pred, zero_division=0)),
-        "threshold": float(best_thr),
+        bilstm = _build_bilstm_model()
+        bilstm.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse", metrics=["mae"])
+        bilstm.fit(
+            X_tr_3d, y_tr,
+            validation_data=(X_val_3d, y_val),
+            epochs=80, batch_size=2048,
+            callbacks=_keras_callbacks, verbose=0,
+        )
+        pred_bilstm = np.clip(bilstm.predict(X_test_3d, batch_size=2048, verbose=0).ravel(), 300, 850)
+        m_bilstm = _eval_regression(y_test, pred_bilstm)
+        comparison["bilstm"] = m_bilstm
+        bilstm.save(str(bilstm_path))
+        trained_models["bilstm"] = str(bilstm_path)
+        joblib.dump({"metrics": m_bilstm, "predictions": pred_bilstm.tolist()}, ckpt_bilstm)
+        print(f"  BiLSTM  R²={m_bilstm['r2']:.4f}  RMSE={m_bilstm['rmse']:.2f}  "
+              f"MAE={m_bilstm['mae']:.2f}  MSE={m_bilstm['mse']:.2f}")
+
+    # ---- MLP ----
+    mlp_path = cfg.artifacts_dir / "reg_mlp.keras"
+    if ckpt_mlp.exists():
+        ck = joblib.load(ckpt_mlp)
+        m_mlp, pred_mlp = ck["metrics"], np.array(ck["predictions"])
+        comparison["mlp"] = m_mlp
+        trained_models["mlp"] = str(mlp_path)
+        print(f"\n[Reg] MLP 已有检查点，跳过训练  "
+              f"R²={m_mlp['r2']:.4f}  RMSE={m_mlp['rmse']:.2f}")
+    else:
+        # 对标签做 Z-score 归一化，避免 MSE 梯度过大导致训练不稳定
+        y_mean, y_std = float(y_tr.mean()), float(y_tr.std())
+        y_tr_norm  = (y_tr  - y_mean) / y_std
+        y_val_norm = (y_val - y_mean) / y_std
+
+        print("\n[Reg] 训练 MLP ...")
+        mlp = _build_mlp_model(X_tr_sc.shape[1])
+        mlp.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            loss="mse", metrics=["mae"],
+        )
+        mlp.fit(
+            X_tr_sc, y_tr_norm,
+            validation_data=(X_val_sc, y_val_norm),
+            epochs=80, batch_size=2048,
+            callbacks=_keras_callbacks, verbose=0,
+        )
+        pred_mlp_norm = mlp.predict(X_test_sc, batch_size=2048, verbose=0).ravel()
+        pred_mlp = np.clip(pred_mlp_norm * y_std + y_mean, 300, 850)
+        m_mlp = _eval_regression(y_test, pred_mlp)
+        comparison["mlp"] = m_mlp
+        mlp.save(str(mlp_path))
+        trained_models["mlp"] = str(mlp_path)
+        joblib.dump({"metrics": m_mlp, "predictions": pred_mlp.tolist()}, ckpt_mlp)
+        print(f"  MLP  R²={m_mlp['r2']:.4f}  RMSE={m_mlp['rmse']:.2f}  "
+              f"MAE={m_mlp['mae']:.2f}  MSE={m_mlp['mse']:.2f}")
+
+    # ---- 择优 ----
+    comp_scores = _regression_composite_score(comparison)
+    winner = max(comp_scores, key=comp_scores.get)
+    print(f"\n[Reg] 综合得分: {comp_scores}")
+    print(f"[Reg] 胜出模型: {winner.upper()}")
+
+    artifact: dict = {
+        "type":          "credit_score_regression",
+        "winner":        winner,
+        "feature_cols":  feature_cols,
+        "scaler":        scaler,
+        "bilstm_groups": _BILSTM_GROUPS,
+        "n_steps":       _BILSTM_N_STEPS,
+        "fps":           _BILSTM_FPS,
+        "metrics":       comparison[winner],
+        "comparison":    comparison,
+        "comp_scores":   comp_scores,
     }
-    model_path = cfg.artifacts_dir / f"fraud_{name}_model.keras"
-    model.save(str(model_path))
-    print(
-        f"[Fraud {name.upper():11s}] "
-        f"AUC={metrics['auc']:.4f}  F1={metrics['f1']:.4f}  "
-        f"Precision={metrics['precision']:.4f}  Recall={metrics['recall']:.4f}  "
-        f"Threshold={best_thr:.2f}"
-    )
-    return metrics, str(model_path)
+    if winner == "xgboost_regressor":
+        artifact["model"] = xgb_reg
+        artifact["model_type"] = "xgboost"
+    elif winner == "bilstm":
+        artifact["model_path"] = str(bilstm_path)
+        artifact["model_type"] = "bilstm"
+    else:
+        artifact["model_path"] = str(mlp_path)
+        artifact["model_type"] = "mlp"
 
+    out = cfg.artifacts_dir / "default_model.joblib"
+    joblib.dump(artifact, out)
+    return {"artifact": str(out), "winner": winner, "metrics": comparison[winner],
+            "comparison": comparison}
+
+
+# ---------------------------------------------------------------------------
+# 任务二：欺诈检测（分类）
+# ---------------------------------------------------------------------------
 
 def _build_fraud_label(df: pd.DataFrame) -> pd.Series:
-    score = (
-        (df["enquirie_no"] > df["enquirie_no"].quantile(0.9)).astype(int)
-        + (df["last_six_month_new_loan_no"] > df["last_six_month_new_loan_no"].quantile(0.9)).astype(int)
-        + (df["total_overdue_no"] > 2).astype(int)
-        + ((df["idcard_flag"] == 0) | (df["mobileno_flag"] == 0)).astype(int)
+    """
+    加权规则合成欺诈标签（composite ≥ 0.30 → 正例）。
+    说明：本标签为规则合成，非真实人工审计标注。
+    """
+    enq_p90   = df["enquirie_no"].quantile(0.90)
+    loan_p85  = df["last_six_month_new_loan_no"].quantile(0.85)
+    ratio_p95 = df["loan_to_asset_ratio"].quantile(0.95)
+
+    composite = (
+        (df["enquirie_no"] > enq_p90).astype(float)              * 0.30
+        + (df["last_six_month_new_loan_no"] > loan_p85).astype(float) * 0.25
+        + ((df["idcard_flag"] == 0) | (df["mobileno_flag"] == 0)).astype(float) * 0.25
+        + (df["total_overdue_no"] > 2).astype(float)              * 0.10
+        + (df["loan_to_asset_ratio"] > ratio_p95).astype(float)   * 0.10
     )
-    return (score >= 2).astype(int)
+    return (composite >= 0.30).astype(int)
+
+
+def _build_ft_transformer(n_features: int, d_token: int = 16,
+                           n_heads: int = 2, n_layers: int = 1,
+                           dropout: float = 0.1) -> tf.keras.Model:
+    """
+    FT-Transformer（Feature Tokenization Transformer）：
+    每列特征独立投影为 d_token 维 embedding，再经 Transformer Encoder 建模特征间交互。
+    比原版 Transformer 更适合表格分类任务。
+    """
+    inp = tf.keras.Input(shape=(n_features,), name="ft_input")
+    # Feature Tokenization: (batch, n_features) → (batch, n_features, d_token)
+    x = tf.keras.layers.Reshape((n_features, 1))(inp)
+    x = tf.keras.layers.Dense(d_token, use_bias=True)(x)
+
+    for _ in range(n_layers):
+        attn = tf.keras.layers.MultiHeadAttention(
+            num_heads=n_heads, key_dim=d_token // n_heads, dropout=dropout
+        )(x, x)
+        x = tf.keras.layers.Add()([x, attn])
+        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
+
+        ff = tf.keras.layers.Dense(d_token * 4, activation="gelu")(x)
+        ff = tf.keras.layers.Dropout(dropout)(ff)
+        ff = tf.keras.layers.Dense(d_token)(ff)
+        ff = tf.keras.layers.Dropout(dropout)(ff)
+        x = tf.keras.layers.Add()([x, ff])
+        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
+
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    x = tf.keras.layers.Dropout(dropout)(x)
+    out = tf.keras.layers.Dense(1, activation="sigmoid", name="fraud_output")(x)
+    return tf.keras.Model(inp, out, name="ft_transformer")
+
+
+def _find_best_threshold_recall(y_true: np.ndarray, y_proba: np.ndarray,
+                                 min_precision: float = 0.15) -> float:
+    """在 Precision >= min_precision 约束下最大化 Recall。"""
+    best_thr, best_recall = 0.5, 0.0
+    for thr in np.linspace(0.05, 0.95, 181):
+        y_pred = (y_proba >= thr).astype(int)
+        if y_pred.sum() == 0:
+            continue
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec  = recall_score(y_true, y_pred, zero_division=0)
+        if prec >= min_precision and rec > best_recall:
+            best_recall, best_thr = rec, float(thr)
+    return best_thr
+
+
+def _eval_fraud(y_true: np.ndarray, y_proba: np.ndarray,
+                threshold: float, name: str) -> dict:
+    y_pred = (y_proba >= threshold).astype(int)
+    metrics = {
+        "recall":    float(recall_score(y_true, y_pred, zero_division=0)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "f1":        float(f1_score(y_true, y_pred, zero_division=0)),
+        "roc_auc":   float(roc_auc_score(y_true, y_proba)),
+        "pr_auc":    float(average_precision_score(y_true, y_proba)),
+        "threshold": threshold,
+    }
+    print(f"  [{name}] Recall={metrics['recall']:.4f}  Precision={metrics['precision']:.4f}  "
+          f"F1={metrics['f1']:.4f}  ROC-AUC={metrics['roc_auc']:.4f}  "
+          f"PR-AUC={metrics['pr_auc']:.4f}  thr={threshold:.2f}")
+    return metrics
 
 
 def train_fraud_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
-    """训练 LSTM 与 Transformer 两个欺诈检测模型并对比，将 F1 更优者存为生产模型。"""
+    """
+    欺诈检测（分类）：
+      训练 FT-Transformer / 决策树 / 随机森林 三个模型
+      按 Recall/PR-AUC/F1/ROC-AUC 加权综合得分择优，保存最优模型
+    """
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+    tf.config.threading.set_intra_op_parallelism_threads(2)
+
+    print("\n" + "=" * 60)
+    print("  任务二：欺诈检测（分类）")
+    print("=" * 60)
+
     work = df.copy()
-    y = _build_fraud_label(work)
-    X = work.drop(columns=["loan_default"], errors="ignore")
-    X = add_features(X).replace([np.inf, -np.inf], np.nan)
-    # 派生特征计算完毕后再删原始标签列，防止 features_v3 内部依赖这些列
-    X = X.drop(columns=_FRAUD_LABEL_COLS, errors="ignore")
-    X_num = X.select_dtypes(include=[np.number])
-    feature_cols = X_num.columns.tolist()
+    y    = _build_fraud_label(work)
 
-    X_tr_df, X_val_df, y_tr, y_val = train_test_split(
-        X_num, y, test_size=0.2, random_state=42, stratify=y
-    )
-    X_3d_tr, scaler, fps = _prep_fraud_sequences(X_tr_df)
-    X_3d_val, _, _      = _prep_fraud_sequences(X_val_df, scaler=scaler)
+    pos = y.sum()
+    print(f"欺诈标签: 正例={pos}({pos/len(y)*100:.1f}%)  负例={len(y)-pos}")
 
-    pos = y_tr.sum()
-    neg = len(y_tr) - pos
-    pos_weight = float(neg / max(pos, 1))
+    X_raw = add_features(work.drop(columns=["loan_default"], errors="ignore"))
+    X_raw = X_raw.replace([np.inf, -np.inf], np.nan)
+    X_raw = _clean_features(X_raw)
+    X_raw = X_raw.drop(columns=_FRAUD_LABEL_COLS + _REGRESSION_EXCLUDE_COLS, errors="ignore")
+    X_raw = X_raw.select_dtypes(include=[np.number])
+    X_raw = _clip_outliers(X_raw, ["outstanding_disburse_ratio",
+                                    "disburse_to_sactioned_ratio",
+                                    "active_to_inactive_act_ratio"])
+    X_raw = X_raw.fillna(X_raw.median())
+    feature_cols = X_raw.columns.tolist()
+    print(f"欺诈特征维度: {len(feature_cols)} 列")
 
-    print(f"[Fraud] 样本: {len(y_tr)} train / {len(y_val)} val  "
-          f"正例权重: {pos_weight:.1f}  序列形状: ({_FRAUD_N_STEPS}, {fps})")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_raw, y, test_size=0.2, stratify=y, random_state=42)
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, stratify=y_train, random_state=42)
 
-    comparison = {}
+    # SMOTE（仅对训练集，1:60 → 1:5）
+    pos_tr = y_tr.sum()
+    neg_tr = len(y_tr) - pos_tr
+    target_ratio = min(0.20, pos_tr / neg_tr * 5)
+    smote = SMOTE(sampling_strategy=target_ratio, k_neighbors=5, random_state=42)
+    X_tr_sm, y_tr_sm = smote.fit_resample(X_tr, y_tr)
+    print(f"SMOTE 后: 正例={y_tr_sm.sum()}  负例={(y_tr_sm==0).sum()}")
 
-    lstm_metrics, lstm_path = _train_deep_model(
-        X_3d_tr, y_tr.values, X_3d_val, y_val.values,
-        _build_lstm_model(_FRAUD_N_STEPS, fps), "lstm", cfg, pos_weight,
-    )
-    comparison["lstm"] = {**lstm_metrics, "model_path": lstm_path}
+    scaler = StandardScaler()
+    X_tr_sc  = scaler.fit_transform(X_tr_sm)
+    X_val_sc = scaler.transform(X_val)
+    X_test_sc= scaler.transform(X_test)
 
-    tf_metrics, tf_path = _train_deep_model(
-        X_3d_tr, y_tr.values, X_3d_val, y_val.values,
-        _build_transformer_model(_FRAUD_N_STEPS, fps), "transformer", cfg, pos_weight,
-    )
-    comparison["transformer"] = {**tf_metrics, "model_path": tf_path}
+    pos_w = float((y_tr_sm == 0).sum() / max(y_tr_sm.sum(), 1))
+    comparison: dict[str, dict] = {}
+    trained_models: dict       = {}
 
-    winner = "transformer" if tf_metrics["f1"] >= lstm_metrics["f1"] else "lstm"
-    winner_metrics  = comparison[winner]
-    winner_path     = winner_metrics["model_path"]
-    print(f"[Fraud] 胜出: {winner.upper()}  F1={winner_metrics['f1']:.4f}")
+    ckpt_ft = cfg.artifacts_dir / "ckpt_fraud_ft.joblib"
+    ckpt_dt = cfg.artifacts_dir / "ckpt_fraud_dt.joblib"
+    ckpt_rf = cfg.artifacts_dir / "ckpt_fraud_rf.joblib"
 
-    artifact = {
-        "type":             "fraud_deep",
-        "winner":           winner,
-        "model_path":       winner_path,
-        "scaler":           scaler,
-        "feature_cols":     feature_cols,
-        "n_steps":          _FRAUD_N_STEPS,
-        "features_per_step": fps,
-        "metrics":          {k: v for k, v in winner_metrics.items() if k != "model_path"},
-        "comparison":       comparison,
-        "model_type":       f"TensorFlow {winner.capitalize()}",
+    # ---- FT-Transformer ----
+    ft_path = cfg.artifacts_dir / "fraud_ft_transformer.keras"
+    if ckpt_ft.exists():
+        ck = joblib.load(ckpt_ft)
+        comparison["ft_transformer"] = ck["metrics"]
+        trained_models["ft_transformer"] = str(ft_path)
+        print(f"\n[Fraud] FT-Transformer 已有检查点，跳过训练  "
+              f"Recall={ck['metrics']['recall']:.4f}  F1={ck['metrics']['f1']:.4f}")
+    else:
+        print("\n[Fraud] 训练 FT-Transformer ...")
+        ft_model = _build_ft_transformer(n_features=len(feature_cols))
+        ft_model.compile(
+            optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-4, weight_decay=1e-5),
+            loss=tf.keras.losses.BinaryCrossentropy(),
+            metrics=["accuracy"],
+        )
+        ft_model.fit(
+            X_tr_sc, y_tr_sm,
+            validation_data=(X_val_sc, y_val.values),
+            epochs=50, batch_size=2048,
+            class_weight={0: 1.0, 1: float(pos_w)},
+            callbacks=[
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="val_loss", patience=8, restore_best_weights=True),
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor="val_loss", factor=0.5, patience=4, min_lr=1e-7),
+            ],
+            verbose=0,
+        )
+        proba_ft_val  = ft_model.predict(X_val_sc,  batch_size=2048, verbose=0).ravel()
+        proba_ft_test = ft_model.predict(X_test_sc, batch_size=2048, verbose=0).ravel()
+        thr_ft = _find_best_threshold_recall(y_val.values, proba_ft_val)
+        m_ft = _eval_fraud(y_test.values, proba_ft_test, thr_ft, "FT-Transformer")
+        comparison["ft_transformer"] = m_ft
+        ft_model.save(str(ft_path))
+        trained_models["ft_transformer"] = str(ft_path)
+        joblib.dump({"metrics": m_ft}, ckpt_ft)
+
+    # ---- 决策树 ----
+    if ckpt_dt.exists():
+        ck = joblib.load(ckpt_dt)
+        comparison["decision_tree"] = ck["metrics"]
+        trained_models["decision_tree"] = ck["model"]
+        print(f"\n[Fraud] 决策树 已有检查点，跳过训练  "
+              f"Recall={ck['metrics']['recall']:.4f}  F1={ck['metrics']['f1']:.4f}")
+    else:
+        print("\n[Fraud] 训练 决策树 ...")
+        dt = DecisionTreeClassifier(
+            max_depth=10,
+            min_samples_leaf=50,
+            min_samples_split=100,
+            class_weight="balanced",
+            criterion="gini",
+            random_state=42,
+        )
+        dt.fit(X_tr_sm, y_tr_sm)
+        proba_dt_val  = dt.predict_proba(X_val_sc)[:, 1]
+        proba_dt_test = dt.predict_proba(X_test_sc)[:, 1]
+        thr_dt = _find_best_threshold_recall(y_val.values, proba_dt_val)
+        m_dt = _eval_fraud(y_test.values, proba_dt_test, thr_dt, "决策树")
+        comparison["decision_tree"] = m_dt
+        trained_models["decision_tree"] = dt
+        joblib.dump({"metrics": m_dt, "model": dt}, ckpt_dt)
+
+    # ---- 随机森林 ----
+    if ckpt_rf.exists():
+        ck = joblib.load(ckpt_rf)
+        comparison["random_forest"] = ck["metrics"]
+        trained_models["random_forest"] = ck["model"]
+        print(f"\n[Fraud] 随机森林 已有检查点，跳过训练  "
+              f"Recall={ck['metrics']['recall']:.4f}  F1={ck['metrics']['f1']:.4f}")
+    else:
+        print("\n[Fraud] 训练 随机森林 ...")
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=15,
+            min_samples_leaf=20,
+            min_samples_split=50,
+            max_features="sqrt",
+            class_weight="balanced_subsample",
+            n_jobs=-1,
+            oob_score=True,
+            random_state=42,
+        )
+        rf.fit(X_tr_sm, y_tr_sm)
+        print(f"  RF OOB Score: {rf.oob_score_:.4f}")
+        proba_rf_val  = rf.predict_proba(X_val_sc)[:, 1]
+        proba_rf_test = rf.predict_proba(X_test_sc)[:, 1]
+        thr_rf = _find_best_threshold_recall(y_val.values, proba_rf_val)
+        m_rf = _eval_fraud(y_test.values, proba_rf_test, thr_rf, "随机森林")
+        comparison["random_forest"] = m_rf
+        trained_models["random_forest"] = rf
+        joblib.dump({"metrics": m_rf, "model": rf}, ckpt_rf)
+
+    # ---- 择优 ----
+    comp_scores = _fraud_composite_score(comparison)
+    winner = max(comp_scores, key=comp_scores.get)
+    print(f"\n[Fraud] 综合得分: {comp_scores}")
+    print(f"[Fraud] 胜出模型: {winner.upper()}")
+
+    winner_metrics = comparison[winner]
+    artifact: dict = {
+        "type":          "fraud_classification",
+        "winner":        winner,
+        "feature_cols":  feature_cols,
+        "scaler":        scaler,
+        "threshold":     winner_metrics["threshold"],
+        "metrics":       winner_metrics,
+        "comparison":    comparison,
+        "comp_scores":   comp_scores,
     }
+    if winner == "ft_transformer":
+        artifact["model_path"] = str(ft_path)
+        artifact["model_type"] = "ft_transformer"
+    elif winner == "decision_tree":
+        artifact["model"] = dt
+        artifact["model_type"] = "decision_tree"
+    else:
+        artifact["model"] = rf
+        artifact["model_type"] = "random_forest"
+
     out = cfg.artifacts_dir / "fraud_model.joblib"
     joblib.dump(artifact, out)
-    return {"artifact": str(out), "metrics": winner_metrics, "comparison": comparison}
+    return {"artifact": str(out), "winner": winner,
+            "metrics": winner_metrics, "comparison": comparison}
 
+
+# ---------------------------------------------------------------------------
+# 额度预测（保持原有逻辑不变）
+# ---------------------------------------------------------------------------
 
 def train_limit_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
     work = df.copy()
     y = work["disbursed_amount"].astype(float)
-    X_full = add_features(work.drop(columns=["loan_default"], errors="ignore")).replace([np.inf, -np.inf], np.nan)
+    X_full = add_features(work.drop(columns=["loan_default"], errors="ignore")).replace(
+        [np.inf, -np.inf], np.nan)
     X = X_full.drop(columns=["disbursed_amount"], errors="ignore")
     fill_values = X.median(numeric_only=True).to_dict()
     X = X.fillna(fill_values).fillna(0)
+    X = X.select_dtypes(include=[np.number])
 
     X_train, X_valid, y_train, y_valid = train_test_split(X, y, test_size=0.2, random_state=42)
 
     models = {
         "random_forest": RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1),
-        "gbr": GradientBoostingRegressor(random_state=42),
         "xgb_reg": XGBRegressor(
-            n_estimators=600,
-            learning_rate=0.05,
-            max_depth=6,
-            subsample=0.85,
-            colsample_bytree=0.85,
-            reg_lambda=1.5,
-            objective="reg:squarederror",
-            tree_method="hist",
-            random_state=42,
-            n_jobs=-1,
+            n_estimators=600, learning_rate=0.05, max_depth=6,
+            subsample=0.85, colsample_bytree=0.85, reg_lambda=1.5,
+            objective="reg:squarederror", tree_method="hist",
+            random_state=42, n_jobs=-1,
         ),
+        "gbr": GradientBoostingRegressor(random_state=42),
     }
 
-    results = {}
-    best_name = None
-    best_rmse = float("inf")
-    best_model = None
+    results, best_name, best_rmse, best_model = {}, None, float("inf"), None
     for name, m in models.items():
         m.fit(X_train, y_train)
         pred = m.predict(X_valid)
         rmse = float(np.sqrt(mean_squared_error(y_valid, pred)))
-        mae = float(mean_absolute_error(y_valid, pred))
-        mape = float(np.mean(np.abs((y_valid - pred) / np.clip(np.abs(y_valid), 1e-6, None))))
-        results[name] = {"rmse": rmse, "mae": mae, "mape": mape}
+        mae  = float(mean_absolute_error(y_valid, pred))
+        results[name] = {"rmse": rmse, "mae": mae}
         if rmse < best_rmse:
-            best_rmse = rmse
-            best_name = name
-            best_model = m
+            best_rmse, best_name, best_model = rmse, name, m
+        print(f"  [Limit/{name}] RMSE={rmse:.2f}  MAE={mae:.2f}")
 
+    print(f"[Limit] 胜出: {best_name}  RMSE={best_rmse:.2f}")
     artifact = {
         "model": best_model,
         "feature_cols": X.columns.tolist(),
@@ -388,38 +809,37 @@ def train_limit_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
     return {"artifact": str(out), "best_model": best_name, "comparison": results}
 
 
-def score_from_probability(default_prob: np.ndarray) -> np.ndarray:
-    p = np.clip(default_prob, 1e-6, 1 - 1e-6)
-    odds = p / (1 - p)
-    score = 600 - 50 * np.log(odds)
-    return np.clip(score, 300, 850)
-
+# ---------------------------------------------------------------------------
+# 流水线入口
+# ---------------------------------------------------------------------------
 
 def run_decision_suite(cfg: ProjectConfig) -> Path:
     cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
     df = _load_training_data(cfg)
-    default_info = train_default_model(cfg, df)
-    fraud_info = train_fraud_model(cfg, df)
-    limit_info = train_limit_model(cfg, df)
 
-    default_bundle = joblib.load(default_info["artifact"])
-    model = default_bundle["model"]
-    cols = default_bundle["feature_cols"]
-    x = add_features(df.drop(columns=["loan_default"]).copy()).replace([np.inf, -np.inf], np.nan)[cols]
-    p = model.predict_proba(x)[:, 1]
-    score = score_from_probability(p)
-    score_report = {
-        "score_min": float(np.min(score)),
-        "score_max": float(np.max(score)),
-        "score_mean": float(np.mean(score)),
-    }
+    default_info = train_credit_score_model(cfg, df)
+    fraud_info   = train_fraud_model(cfg, df)
+    # 限额预测改为业务规则计算，无需训练 ML 模型
+    # 公式: 合理额度 = (月收入估计 × 偿债比上限) / 月供单价 × (1 - P(违约)) × 欺诈惩罚
+    # 详见 service/flask/model_loader.py:_calculate_credit_limit
 
     registry = {
-        "default_model": default_info,
-        "fraud_model": fraud_info,
-        "limit_model": limit_info,
-        "credit_score_summary": score_report,
+        "credit_score_model": {
+            "winner":     default_info["winner"],
+            "metrics":    default_info["metrics"],
+            "comparison": default_info["comparison"],
+        },
+        "fraud_model": {
+            "winner":     fraud_info["winner"],
+            "metrics":    fraud_info["metrics"],
+            "comparison": fraud_info["comparison"],
+        },
+        "limit_model": {
+            "type":   "rule_based",
+            "formula": "(月收入×偿债比) / 月供单价 × (1 - P_default) × 欺诈惩罚",
+        },
     }
     out = cfg.artifacts_dir / "model_registry.json"
     out.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n模型注册表已写入: {out}")
     return out

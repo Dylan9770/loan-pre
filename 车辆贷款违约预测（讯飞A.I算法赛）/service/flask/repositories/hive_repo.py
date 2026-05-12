@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from pyhive import hive
-
 from service.flask.config import Settings
 
 
 def _connect():
+    # 懒加载 pyhive，本地环境无 Hive 时不影响 Flask 启动
+    from pyhive import hive
     return hive.Connection(
         host=Settings.HIVE_HOST,
         port=Settings.HIVE_PORT,
@@ -15,7 +15,10 @@ def _connect():
 
 
 def fetch_risk_daily_summary(limit: int = 30) -> list[dict]:
-    conn = _connect()
+    try:
+        conn = _connect()
+    except Exception:
+        return []   # Hive 不可达时返回空，stats.py 会回退到 mock 数据
     try:
         cur = conn.cursor()
         cur.execute(

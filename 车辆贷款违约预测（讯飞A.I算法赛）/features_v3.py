@@ -323,6 +323,40 @@ def add_composite_risk_score(df: pd.DataFrame) -> pd.DataFrame:
 # Part 6: Interaction & Polynomial Features
 # ============================================================
 
+def add_plan_features(df: pd.DataFrame) -> pd.DataFrame:
+    """方案要求的补充特征：has_credit_score / has_credit_level / recent_stress 等。"""
+    out = df.copy()
+
+    if "credit_score" in out.columns:
+        out["has_credit_score"] = (out["credit_score"] > 0).astype(int)
+
+    if "Credit_level" in out.columns:
+        out["has_credit_level"] = (out["Credit_level"] > 0).astype(int)
+
+    for col in ["last_six_month_new_loan_no", "last_six_month_defaulted_no"]:
+        if col not in out.columns:
+            out[col] = 0
+    out["recent_stress"] = out["last_six_month_new_loan_no"] + out["last_six_month_defaulted_no"]
+
+    if "enquirie_no" in out.columns and "credit_history" in out.columns:
+        out["inquiry_intensity"] = _safe_div(out["enquirie_no"], out["credit_history"] + 1)
+
+    if "disbursed_amount" in out.columns and "age" in out.columns:
+        out["loan_per_age"] = _safe_div(out["disbursed_amount"], out["age"] + 1)
+
+    if "total_sanction_loan" in out.columns and "total_outstanding_loan" in out.columns:
+        out["credit_gap"] = out["total_sanction_loan"] - out["total_outstanding_loan"]
+
+    if all(c in out.columns for c in ["mobileno_flag", "idcard_flag", "Driving_flag", "passport_flag"]):
+        out["identity_score"] = (
+            out["mobileno_flag"].fillna(0) + out["idcard_flag"].fillna(0)
+            + out["Driving_flag"].fillna(0) + out["passport_flag"].fillna(0)
+        )
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
 def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     """高阶交叉特征：credit_score × 风险指标、账户压力指标等。"""
     out = df.copy()
@@ -417,7 +451,10 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     # Step 6: Composite risk
     df = add_composite_risk_score(df)
 
-    # Step 7: Interaction & polynomial features
+    # Step 7: Plan-specific supplement features
+    df = add_plan_features(df)
+
+    # Step 8: Interaction & polynomial features
     df = add_interaction_features(df)
 
     # Final cleanup

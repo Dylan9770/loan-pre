@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from flask import Blueprint, jsonify
 
-from service.flask.model_loader import predict_default, predict_fraud, predict_limit, score_credit
+from service.flask.model_loader import predict_default, predict_fraud, predict_limit
 from service.flask.repositories.mysql_repo import (
     fetch_customer_loan_facts,
     fetch_customer_profile,
@@ -262,14 +262,17 @@ def get_customer_profile(customer_id: int):
     # Get prediction results
     prediction_real = False
     try:
-        pred_default = predict_default([profile])
-        pred_fraud = predict_fraud([profile])
-        pred_limit = predict_limit([profile])
-
-        default_prob = pred_default[0]["default_probability"] if pred_default else 0.0
-        fraud_prob = pred_fraud[0]["fraud_probability"] if pred_fraud else 0.0
+        pred_default = predict_default([profile])           # 现在直接返回 credit_score
+        pred_fraud   = predict_fraud([profile])
+        # predict_limit 依赖 credit_score 和 fraud_prob，复用前两步结果
+        credit_score_val = pred_default[0]["credit_score"]  if pred_default else 600.0
+        fraud_prob       = pred_fraud[0]["fraud_probability"] if pred_fraud   else 0.0
+        pred_limit       = predict_limit([profile],
+                                          credit_scores=[credit_score_val],
+                                          fraud_probs=[fraud_prob])
         limit_val = pred_limit[0]["predicted_limit"] if pred_limit else 0.0
-        credit_score_val = score_credit([default_prob])[0]
+        # 由 credit_score 反推 default_probability（评分卡公式逆运算）
+        default_prob = 1.0 / (1.0 + 2 ** ((credit_score_val - 600) / 50))
         prediction_real = True
     except Exception:
         # Fallback mock predictions

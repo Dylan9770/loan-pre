@@ -41,7 +41,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import get_config
 from src.decision import (
-    train_default_model, train_fraud_model, train_limit_model,
+    train_credit_score_model as train_default_model,
+    train_fraud_model, train_limit_model,
     score_from_probability, run_decision_suite as _run_decision_suite,
 )
 from features_v3 import add_features as add_features_v3
@@ -66,7 +67,7 @@ def run_local_pipeline(
     流程：加载数据 → 特征工程 → 训练 3 个模型 → 注册到制品库
     """
     _print_header(f"Local Pipeline (features_v{features_version})")
-    stages = stages or ["default", "fraud", "limit"]
+    stages = stages or ["default", "fraud"]   # limit 改为业务规则计算，无需训练
 
     # ---- 1. 加载数据 ----
     repaired_path = cfg.featured_dir / "train_repaired.csv"
@@ -96,29 +97,34 @@ def run_local_pipeline(
 
     # ---- 3. 训练模型 ----
     if "default" in stages:
-        _print_header("Stage 1: Training Default Model (XGBoost)")
+        _print_header("Stage 1: Training Credit Score Model (XGBReg / BiLSTM / MLP)")
         t0 = time.time()
         default_result = train_default_model(cfg, df)
+        m = default_result["metrics"]
         results["stages"]["default"] = {
-            "artifact": default_result["artifact"],
-            "metrics": default_result["metrics"],
+            "artifact":    default_result["artifact"],
+            "winner":      default_result["winner"],
+            "metrics":     m,
             "elapsed_sec": round(time.time() - t0, 2),
         }
-        print(f"  AUC={default_result['metrics']['auc']:.6f}, "
-              f"ACC={default_result['metrics']['accuracy']:.6f}, "
-              f"F1={default_result['metrics']['f1']:.6f}")
+        print(f"  Winner={default_result['winner']}  "
+              f"R²={m.get('r2', 0):.4f}  RMSE={m.get('rmse', 0):.2f}  "
+              f"MAE={m.get('mae', 0):.2f}")
 
     if "fraud" in stages:
-        _print_header("Stage 2: Training Fraud Model (XGBoost)")
+        _print_header("Stage 2: Training Fraud Model (FT-Transformer / DT / RF)")
         t0 = time.time()
         fraud_result = train_fraud_model(cfg, df)
+        m = fraud_result["metrics"]
         results["stages"]["fraud"] = {
-            "artifact": fraud_result["artifact"],
-            "metrics": fraud_result["metrics"],
+            "artifact":    fraud_result["artifact"],
+            "winner":      fraud_result["winner"],
+            "metrics":     m,
             "elapsed_sec": round(time.time() - t0, 2),
         }
-        print(f"  AUC={fraud_result['metrics']['auc']:.6f}, "
-              f"ACC={fraud_result['metrics']['accuracy']:.6f}")
+        print(f"  Winner={fraud_result['winner']}  "
+              f"Recall={m.get('recall', 0):.4f}  F1={m.get('f1', 0):.4f}  "
+              f"PR-AUC={m.get('pr_auc', 0):.4f}")
 
     if "limit" in stages:
         _print_header("Stage 3: Training Limit Model (XGBoost / RF / GBR ensemble)")
@@ -211,11 +217,13 @@ def run_spark_pipeline(
 
     results = {}
     if "default" in stages:
-        print(f"[3/3] Training default model...")
+        print(f"[3/3] Training credit score model...")
         t0 = time.time()
         result = train_default_model(cfg, df)
-        results["default"] = {"metrics": result["metrics"], "elapsed_sec": round(time.time() - t0, 2)}
-        print(f"  AUC={result['metrics']['auc']:.6f}")
+        m = result["metrics"]
+        results["default"] = {"winner": result["winner"], "metrics": m,
+                               "elapsed_sec": round(time.time() - t0, 2)}
+        print(f"  Winner={result['winner']}  R²={m.get('r2', 0):.4f}")
 
     return results
 
@@ -235,8 +243,8 @@ def main() -> None:
         "--stages",
         nargs="+",
         choices=["default", "fraud", "limit"],
-        default=["default", "fraud", "limit"],
-        help="要训练哪些模型",
+        default=["default", "fraud"],   # limit 改为业务规则计算，无需训练
+        help="要训练哪些模型（limit 已改为业务规则，无需训练）",
     )
     parser.add_argument(
         "--skip-repair",
