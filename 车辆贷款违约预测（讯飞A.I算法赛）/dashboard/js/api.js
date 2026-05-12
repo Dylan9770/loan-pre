@@ -94,7 +94,22 @@ const API = {
 
   /* ---------- 客户画像 ---------- */
   async customerProfile(customerId) {
-    return this.get(`/customer/${customerId}/profile`);
+    // 区分 404（客户不存在）与其他错误，让前端能弹"客户不存在"
+    try {
+      const response = await fetch(`/customer/${customerId}/profile`);
+      if (response.status === 404) {
+        return { __not_found: true, customer_id: customerId };
+      }
+      if (!response.ok) return null;
+      return await response.json();
+    } catch (e) {
+      console.error(`[API] GET /customer/${customerId}/profile failed:`, e);
+      return null;
+    }
+  },
+
+  async customerRandomId() {
+    return this.get('/customer/random_id');
   },
 
   async customerSimilar(customerId) {

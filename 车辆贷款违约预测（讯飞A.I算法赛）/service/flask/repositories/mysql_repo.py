@@ -116,7 +116,7 @@ def fetch_cluster_samples(limit: int = 500) -> list[dict]:
 
 
 def fetch_recent_real_customers(limit: int = 10) -> list[dict]:
-    """Return a batch of real customer records (profile + loan fields) for online scoring."""
+    """Return a batch of real customer records with FULL feature set (for online scoring)."""
     try:
         conn = _connect(Settings.MYSQL_DB_ODS)
     except Exception:
@@ -125,14 +125,9 @@ def fetch_recent_real_customers(limit: int = 10) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT c.customer_id, c.age, c.employment_type, c.credit_score,
-                       c.area_id, l.disbursed_amount, l.asset_cost, l.ltv_ratio,
-                       l.total_disbursed_loan, l.total_monthly_payment,
-                       l.total_overdue_no, l.total_outstanding_loan
-                FROM customer_profile c
-                JOIN loan_fact l ON c.customer_id = l.customer_id
-                WHERE c.credit_score > 0 AND l.disbursed_amount > 0
-                ORDER BY c.updated_at DESC, c.customer_id DESC
+                SELECT * FROM customer_features
+                WHERE credit_score > 0 AND disbursed_amount > 0
+                ORDER BY ingested_at DESC, customer_id DESC
                 LIMIT {int(limit)}
                 """
             )
@@ -197,26 +192,45 @@ def fetch_recent_decisions(limit: int = 10) -> list[dict]:
         conn.close()
 
 
+def fetch_random_customer_id() -> int | None:
+    """Pick a random customer_id that actually exists in customer_features."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM customer_features")
+            total = int((cur.fetchone() or {}).get("c") or 0)
+            if total <= 0:
+                return None
+            import random
+            offset = random.randint(0, total - 1)
+            cur.execute(f"SELECT customer_id FROM customer_features LIMIT 1 OFFSET {offset}")
+            row = cur.fetchone()
+            return int(row["customer_id"]) if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def fetch_customer_profile(customer_id: int) -> dict | None:
-    """Fetch customer basic info from MySQL. Returns None if not found."""
-    conn = _connect(Settings.MYSQL_DB_ODS)
+    """Fetch full customer feature row from customer_features (for model scoring + UI)."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return None
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT c.*, l.disbursed_amount, l.asset_cost, l.total_overdue_no,
-                       l.total_disbursed_loan, l.total_monthly_payment
-                FROM customer_profile c
-                LEFT JOIN loan_fact l ON c.customer_id = l.customer_id
-                WHERE c.customer_id = %s
-                LIMIT 1
-                """,
+                "SELECT * FROM customer_features WHERE customer_id = %s LIMIT 1",
                 (customer_id,),
             )
             row = cur.fetchone()
-            if row:
-                return dict(row)
-            return None
+            return dict(row) if row else None
+    except Exception:
+        return None
     finally:
         conn.close()
 

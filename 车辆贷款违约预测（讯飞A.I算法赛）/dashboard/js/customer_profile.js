@@ -314,9 +314,14 @@ async function searchCustomer() {
   const id = parseInt(input?.value || '0', 10);
   if (!id) { alert('请输入有效的客户ID'); return; }
 
-  // 尝试从API加载
-  const [profile, similar, timeline] = await Promise.all([
-    API.customerProfile(id).catch(() => null),
+  // 先单独查 profile，若 404 直接提示并停止
+  const profile = await API.customerProfile(id).catch(() => null);
+  if (profile && profile.__not_found) {
+    alert(`客户 ${id} 不存在于数据库中，请重新输入有效的客户ID`);
+    return;
+  }
+
+  const [similar, timeline] = await Promise.all([
     API.customerSimilar(id).catch(() => null),
     API.customerLoanHistory(id).catch(() => null),
   ]);
@@ -372,8 +377,14 @@ async function searchCustomer() {
 }
 
 /* ---------- 随机客户 ---------- */
-function loadRandomCustomer() {
-  const id = Math.floor(Math.random() * 999999) + 100001;
+async function loadRandomCustomer() {
+  // 从后端真实库里抽一个 customer_id，确保不会落到不存在的客户上
+  const resp = await API.customerRandomId().catch(() => null);
+  const id = resp && resp.customer_id;
+  if (!id) {
+    alert('无法从数据库获取随机客户，请稍后再试');
+    return;
+  }
   document.getElementById('customerIdInput').value = id;
   searchCustomer();
 }

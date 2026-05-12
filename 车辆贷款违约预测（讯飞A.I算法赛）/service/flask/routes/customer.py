@@ -15,6 +15,8 @@ from service.flask.repositories.mysql_repo import (
     fetch_customer_loan_facts,
     fetch_customer_profile,
     fetch_customer_similar,
+    fetch_random_customer_id,
+    insert_realtime_decision,
 )
 
 customer_bp = Blueprint("customer_bp", __name__, url_prefix="/customer")
@@ -231,22 +233,34 @@ def _build_mock_timeline(customer_id: int) -> list[dict]:
     return events
 
 
+@customer_bp.get("/random_id")
+def get_random_customer_id():
+    """Return a real customer_id from the DB so the dashboard random button never hits a missing record."""
+    cid = fetch_random_customer_id()
+    if cid is None:
+        return jsonify({"error": "no customer available"}), 503
+    return jsonify({"customer_id": cid})
+
+
 @customer_bp.get("/<int:customer_id>/profile")
 def get_customer_profile(customer_id: int):
-    """Return complete customer profile with radar scores."""
-    # Try to fetch from MySQL first
+    """Return complete customer profile with radar scores. 404 if the customer is not in the DB."""
     db_profile = fetch_customer_profile(customer_id)
 
-    if db_profile:
-        profile = db_profile
-    else:
-        # Fall back to mock data for demo
-        profile = _build_mock_profile(customer_id)
+    if not db_profile:
+        return jsonify({
+            "error": "customer not found",
+            "customer_id": customer_id,
+            "message": f"客户 {customer_id} 不存在于数据库中",
+        }), 404
+
+    profile = db_profile
 
     # Compute radar chart scores
     radar = _compute_radar_scores(profile)
 
     # Get prediction results
+    prediction_real = False
     try:
         pred_default = predict_default([profile])
         pred_fraud = predict_fraud([profile])
@@ -256,6 +270,7 @@ def get_customer_profile(customer_id: int):
         fraud_prob = pred_fraud[0]["fraud_probability"] if pred_fraud else 0.0
         limit_val = pred_limit[0]["predicted_limit"] if pred_limit else 0.0
         credit_score_val = score_credit([default_prob])[0]
+        prediction_real = True
     except Exception:
         # Fallback mock predictions
         base_prob = (1000 - (customer_id % 1000)) / 1000.0
@@ -263,6 +278,21 @@ def get_customer_profile(customer_id: int):
         fraud_prob = max(0.01, min(0.5, (customer_id % 50) / 100))
         limit_val = 10000 + (customer_id % 80000)
         credit_score_val = 600 - 50 * math.log(default_prob / (1 - default_prob))
+
+    # 把真实预测结果落库到 realtime_decisions，看板"最新决策"会读这张表
+    if prediction_real:
+        try:
+            insert_realtime_decision({
+                "customer_id": customer_id,
+                "default_probability": float(default_prob),
+                "default_pred": 1 if default_prob >= 0.5 else 0,
+                "fraud_probability": float(fraud_prob),
+                "fraud_pred": 1 if fraud_prob >= 0.5 else 0,
+                "predicted_limit": float(limit_val),
+                "credit_score": float(credit_score_val),
+            })
+        except Exception:
+            pass  # 落库失败不影响接口返回
 
     result = {
         "customer_id": customer_id,

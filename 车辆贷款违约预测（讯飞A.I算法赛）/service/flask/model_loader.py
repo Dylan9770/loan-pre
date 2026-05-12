@@ -19,21 +19,33 @@ def _load(path_name: str) -> dict:
 
 def predict_default(records: list[dict]) -> list[dict]:
     bundle = _load("default_model.joblib")
-    model = bundle["model"]
     cols = bundle["feature_cols"]
     df = add_features(pd.DataFrame(records)).replace([np.inf, -np.inf], np.nan)
     x = df.reindex(columns=cols)
-    proba = model.predict_proba(x)[:, 1]
-    out = []
-    for i, p in enumerate(proba):
-        out.append(
-            {
-                "customer_id": records[i].get("customer_id"),
-                "default_probability": float(p),
-                "default_pred": int(p >= 0.5),
-            }
-        )
-    return out
+
+    # 支持单模型 / lgb+xgb 集成两种 bundle 结构
+    if "model" in bundle:
+        proba = bundle["model"].predict_proba(x)[:, 1]
+    elif "lgb_model" in bundle and "xgb_model" in bundle:
+        lgb_p = bundle["lgb_model"].predict_proba(x)[:, 1]
+        xgb_p = bundle["xgb_model"].predict_proba(x)[:, 1]
+        proba = (lgb_p + xgb_p) / 2.0
+    elif "lgb_model" in bundle:
+        proba = bundle["lgb_model"].predict_proba(x)[:, 1]
+    elif "xgb_model" in bundle:
+        proba = bundle["xgb_model"].predict_proba(x)[:, 1]
+    else:
+        raise KeyError("default_model.joblib 缺少 'model'/'lgb_model'/'xgb_model'")
+
+    threshold = float(bundle.get("threshold", 0.5))
+    return [
+        {
+            "customer_id": records[i].get("customer_id"),
+            "default_probability": float(p),
+            "default_pred": int(p >= threshold),
+        }
+        for i, p in enumerate(proba)
+    ]
 
 
 def predict_fraud(records: list[dict]) -> list[dict]:

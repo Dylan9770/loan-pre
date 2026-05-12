@@ -170,88 +170,22 @@ def stats_credit_score_dist():
     })
 
 
-def _score_real_customers(limit: int = 10) -> list[dict]:
-    """Take real customers from MySQL and run live model predictions on them."""
-    from service.flask.model_loader import (
-        predict_default,
-        predict_fraud,
-        predict_limit,
-        score_credit,
-    )
-
-    customers = fetch_recent_real_customers(limit=limit)
-    if not customers:
-        return []
-
-    try:
-        default_out = predict_default(customers)
-        fraud_out = predict_fraud(customers)
-        limit_out = predict_limit(customers)
-        scores = score_credit([d["default_probability"] for d in default_out])
-    except Exception:
-        return []
-
-    now = datetime.now()
-    rows = []
-    for i, c in enumerate(customers):
-        rows.append({
-            "customer_id": int(c.get("customer_id")),
-            "default_probability": round(float(default_out[i]["default_probability"]), 4),
-            "fraud_probability": round(float(fraud_out[i]["fraud_probability"]), 4),
-            "predicted_limit": round(float(limit_out[i]["predicted_limit"]), 2),
-            "credit_score": round(float(scores[i]), 1),
-            "created_at": (now - timedelta(seconds=i * 17)).strftime("%Y-%m-%d %H:%M:%S"),
-        })
-    return rows
-
-
 @stats_bp.get("/stats/recent_decisions")
 def stats_recent_decisions():
-    """Return latest decisions.
+    """Return latest decisions made by users querying /customer/<id>/profile.
 
-    Priority:
-      1) 真实 realtime_decisions 表（若有写入）
-      2) 现场从真实客户跑模型预测（带 60s 内存缓存）
-      3) Mock 兜底
+    每次访问客户画像 → realtime_decisions 表新增一行 → 这里按 created_at 倒序读。
+    表为空时返回空数组（前端会显示"暂无数据"），不再伪造记录。
     """
     try:
         rows = fetch_recent_decisions(limit=10)
     except Exception:
         rows = []
-
-    if not rows:
-        now = datetime.now()
-        cached = _DECISIONS_CACHE.get("data")
-        ts = _DECISIONS_CACHE.get("ts")
-        if cached and ts and (now - ts).total_seconds() < _DECISIONS_TTL_SEC:
-            rows = cached
-        else:
-            rows = _score_real_customers(limit=10)
-            if rows:
-                _DECISIONS_CACHE["data"] = rows
-                _DECISIONS_CACHE["ts"] = now
-
-    if not rows:
-        # 最终兜底
-        samples = [
-            (742, 0.12, 0.03, 185000),
-            (485, 0.67, 0.15, 60000),
-            (698, 0.21, 0.05, 142000),
-            (785, 0.08, 0.01, 320000),
-            (562, 0.45, 0.22, 80000),
-        ]
-        now = datetime.now()
-        rows = [
-            {
-                "customer_id": 100001 + i,
-                "credit_score": s[0],
-                "default_probability": s[1],
-                "fraud_probability": s[2],
-                "predicted_limit": s[3],
-                "created_at": (now - timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
-            }
-            for i, s in enumerate(samples)
-        ]
+    # 字段格式化：created_at 转字符串
+    for r in rows:
+        ts = r.get("created_at")
+        if ts is not None and not isinstance(ts, str):
+            r["created_at"] = ts.strftime("%Y-%m-%d %H:%M:%S")
     return jsonify(rows)
 
 
