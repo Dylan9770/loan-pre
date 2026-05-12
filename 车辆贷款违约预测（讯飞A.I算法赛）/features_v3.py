@@ -320,6 +320,64 @@ def add_composite_risk_score(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# Part 6: Interaction & Polynomial Features
+# ============================================================
+
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """高阶交叉特征：credit_score × 风险指标、账户压力指标等。"""
+    out = df.copy()
+
+    # credit_score 多项式
+    if "credit_score" in out.columns:
+        cs = out["credit_score"]
+        out["credit_score_sq"]   = cs ** 2
+        out["credit_score_sqrt"] = np.sqrt(cs.clip(0))
+        out["credit_score_log"]  = np.log1p(cs.clip(0))
+
+    # credit_score × 逾期率交叉
+    if "credit_score" in out.columns and "overdue_rate_total" in out.columns:
+        out["cs_x_overdue"] = out["credit_score"] * out["overdue_rate_total"]
+
+    if "credit_score" in out.columns and "recent_default_rate" in out.columns:
+        out["cs_x_recent_def"] = out["credit_score"] * out["recent_default_rate"]
+
+    if "credit_score" in out.columns and "ltv_ratio" in out.columns:
+        out["cs_x_ltv"] = out["credit_score"] * out["ltv_ratio"]
+
+    # 账户负债压力：未偿 / 发放 × 月供
+    if all(c in out.columns for c in ["total_outstanding_loan", "total_disbursed_loan"]):
+        out["debt_pressure"] = _safe_div(out["total_outstanding_loan"], out["total_disbursed_loan"])
+
+    if all(c in out.columns for c in ["total_monthly_payment", "disbursed_amount"]):
+        out["payment_burden"] = _safe_div(out["total_monthly_payment"], out["disbursed_amount"])
+
+    # 主账户质量：逾期/账户数 × 活跃比
+    if all(c in out.columns for c in ["main_account_overdue_no", "main_account_loan_no"]):
+        out["main_overdue_density"] = _safe_div(
+            out["main_account_overdue_no"], out["main_account_loan_no"]
+        )
+
+    # 近6个月新增贷款 / 历史信用账户
+    if all(c in out.columns for c in ["last_six_month_new_loan_no", "total_account_loan_no"]):
+        out["new_loan_velocity"] = _safe_div(
+            out["last_six_month_new_loan_no"], out["total_account_loan_no"]
+        )
+
+    # 信用利用率：outstanding / sanction
+    if all(c in out.columns for c in ["total_outstanding_loan", "total_sanction_loan"]):
+        out["credit_utilization"] = _safe_div(
+            out["total_outstanding_loan"], out["total_sanction_loan"]
+        )
+
+    # 主/子账户逾期差异
+    if all(c in out.columns for c in ["main_account_overdue_no", "sub_account_overdue_no"]):
+        out["overdue_imbalance"] = out["main_account_overdue_no"] - out["sub_account_overdue_no"]
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+# ============================================================
 # Master Feature Function
 # ============================================================
 
@@ -358,6 +416,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Step 6: Composite risk
     df = add_composite_risk_score(df)
+
+    # Step 7: Interaction & polynomial features
+    df = add_interaction_features(df)
 
     # Final cleanup
     df = df.replace([np.inf, -np.inf], np.nan)

@@ -3,10 +3,33 @@ from __future__ import annotations
 from flask import Blueprint, jsonify
 
 from service.flask.repositories.hive_repo import fetch_risk_daily_summary
+from datetime import datetime, timedelta
+
 from service.flask.repositories.mysql_repo import (
     fetch_area_risk_summary,
+    fetch_cluster_samples,
+    fetch_dashboard_overview,
     fetch_realtime_summary,
+    fetch_recent_decisions,
+    fetch_recent_real_customers,
 )
+
+
+# ---- 简单内存缓存（避免每次请求都重跑模型预测） ----
+_DECISIONS_CACHE: dict = {"data": None, "ts": None}
+_DECISIONS_TTL_SEC = 60
+
+
+def _classify_cluster(credit_score: float, amount: float, default: int) -> str:
+    if default == 1 or credit_score < 500:
+        if amount < 30000:
+            return "低信用高风险"
+        return "低信用中额度"
+    if credit_score >= 700:
+        return "高信用高额度" if amount >= 60000 else "中信用中额度"
+    if amount < 30000:
+        return "中信用低额度"
+    return "中信用中额度"
 
 
 stats_bp = Blueprint("stats_bp", __name__)
@@ -19,18 +42,36 @@ def health():
 
 @stats_bp.get("/stats/overview")
 def stats_overview():
-    summary = fetch_realtime_summary()
-    # If no real data, return mock overview
-    if not summary or summary.get("realtime_events", 0) == 0:
-        summary = {
-            "total_customers": 2263847,
-            "total_amount": 158.24,
-            "overdue_rate": 0.0582,
-            "new_customers": 12458,
-            "realtime_events": 0,
-            "realtime_decisions": 0,
+    # 实时表里的 events/decisions 计数
+    try:
+        rt = fetch_realtime_summary() or {}
+    except Exception:
+        rt = {}
+
+    # 真实业务 KPI（customer_profile + loan_fact）
+    overview = fetch_dashboard_overview()
+    if overview:
+        # 前端字段名兼容：把 defaulted_customers 映射到 new_customers
+        # （前端 KPI 标签已改为"违约客户数"）
+        result = {
+            "total_customers": overview["total_customers"],
+            "total_amount": overview["total_amount"],
+            "overdue_rate": overview["overdue_rate"],
+            "new_customers": overview["defaulted_customers"],
+            "realtime_events": int(rt.get("realtime_events", 0)),
+            "realtime_decisions": int(rt.get("realtime_decisions", 0)),
         }
-    return jsonify(summary)
+    else:
+        # 数据库不可达时的兜底
+        result = {
+            "total_customers": 0,
+            "total_amount": 0,
+            "overdue_rate": 0,
+            "new_customers": 0,
+            "realtime_events": int(rt.get("realtime_events", 0)),
+            "realtime_decisions": int(rt.get("realtime_decisions", 0)),
+        }
+    return jsonify(result)
 
 
 @stats_bp.get("/stats/risk_daily")
@@ -90,17 +131,34 @@ def stats_area_risk():
 
 @stats_bp.get("/stats/customer_cluster")
 def stats_customer_cluster():
-    """Return customer clustering distribution for scatter chart."""
-    return jsonify({
-        "clusters": [
-            {"name": "高信用高额度", "color": "#34a853", "count": 339577},
-            {"name": "中信用中额度", "color": "#1a73e8", "count": 905535},
-            {"name": "中信用低额度", "color": "#f9ab00", "count": 565962},
-            {"name": "低信用中额度", "color": "#f57c00", "count": 339577},
-            {"name": "低信用高风险", "color": "#ea4335", "count": 113196},
-        ],
-        "scatterData": [],  # Scatter data computed client-side
-    })
+    """Return cluster meta + real scatter data sampled from customer_profile + loan_fact."""
+    cluster_meta = [
+        {"name": "高信用高额度", "color": "#34a853"},
+        {"name": "中信用中额度", "color": "#1a73e8"},
+        {"name": "中信用低额度", "color": "#f9ab00"},
+        {"name": "低信用中额度", "color": "#f57c00"},
+        {"name": "低信用高风险", "color": "#ea4335"},
+    ]
+
+    samples = fetch_cluster_samples(limit=500)
+    scatter_data = []
+    counts = {c["name"]: 0 for c in cluster_meta}
+    for s in samples:
+        score = float(s.get("credit_score") or 0)
+        amount = float(s.get("disbursed_amount") or 0)
+        default = int(s.get("loan_default") or 0)
+        name = _classify_cluster(score, amount, default)
+        scatter_data.append([round(score, 1), round(amount, 0), name])
+        counts[name] = counts.get(name, 0) + 1
+
+    clusters = [{**c, "count": counts.get(c["name"], 0)} for c in cluster_meta]
+
+    # 兜底：如果数据库没数据，回退到原来的 mock counts
+    if not scatter_data:
+        fallback_counts = [339577, 905535, 565962, 339577, 113196]
+        clusters = [{**c, "count": fallback_counts[i]} for i, c in enumerate(cluster_meta)]
+
+    return jsonify({"clusters": clusters, "scatterData": scatter_data})
 
 
 @stats_bp.get("/stats/credit_score_dist")
@@ -110,6 +168,91 @@ def stats_credit_score_dist():
         "buckets": ["300-400", "400-500", "500-600", "600-700", "700-800", "800-850"],
         "counts": [45000, 180000, 680000, 800000, 450000, 110000],
     })
+
+
+def _score_real_customers(limit: int = 10) -> list[dict]:
+    """Take real customers from MySQL and run live model predictions on them."""
+    from service.flask.model_loader import (
+        predict_default,
+        predict_fraud,
+        predict_limit,
+        score_credit,
+    )
+
+    customers = fetch_recent_real_customers(limit=limit)
+    if not customers:
+        return []
+
+    try:
+        default_out = predict_default(customers)
+        fraud_out = predict_fraud(customers)
+        limit_out = predict_limit(customers)
+        scores = score_credit([d["default_probability"] for d in default_out])
+    except Exception:
+        return []
+
+    now = datetime.now()
+    rows = []
+    for i, c in enumerate(customers):
+        rows.append({
+            "customer_id": int(c.get("customer_id")),
+            "default_probability": round(float(default_out[i]["default_probability"]), 4),
+            "fraud_probability": round(float(fraud_out[i]["fraud_probability"]), 4),
+            "predicted_limit": round(float(limit_out[i]["predicted_limit"]), 2),
+            "credit_score": round(float(scores[i]), 1),
+            "created_at": (now - timedelta(seconds=i * 17)).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return rows
+
+
+@stats_bp.get("/stats/recent_decisions")
+def stats_recent_decisions():
+    """Return latest decisions.
+
+    Priority:
+      1) 真实 realtime_decisions 表（若有写入）
+      2) 现场从真实客户跑模型预测（带 60s 内存缓存）
+      3) Mock 兜底
+    """
+    try:
+        rows = fetch_recent_decisions(limit=10)
+    except Exception:
+        rows = []
+
+    if not rows:
+        now = datetime.now()
+        cached = _DECISIONS_CACHE.get("data")
+        ts = _DECISIONS_CACHE.get("ts")
+        if cached and ts and (now - ts).total_seconds() < _DECISIONS_TTL_SEC:
+            rows = cached
+        else:
+            rows = _score_real_customers(limit=10)
+            if rows:
+                _DECISIONS_CACHE["data"] = rows
+                _DECISIONS_CACHE["ts"] = now
+
+    if not rows:
+        # 最终兜底
+        samples = [
+            (742, 0.12, 0.03, 185000),
+            (485, 0.67, 0.15, 60000),
+            (698, 0.21, 0.05, 142000),
+            (785, 0.08, 0.01, 320000),
+            (562, 0.45, 0.22, 80000),
+        ]
+        now = datetime.now()
+        rows = [
+            {
+                "customer_id": 100001 + i,
+                "credit_score": s[0],
+                "default_probability": s[1],
+                "fraud_probability": s[2],
+                "predicted_limit": s[3],
+                "created_at": (now - timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+            }
+            for i, s in enumerate(samples)
+        ]
+    return jsonify(rows)
 
 
 @stats_bp.get("/model/shap_values")

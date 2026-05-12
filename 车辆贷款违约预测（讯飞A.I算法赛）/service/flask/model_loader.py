@@ -38,16 +38,31 @@ def predict_default(records: list[dict]) -> list[dict]:
 
 def predict_fraud(records: list[dict]) -> list[dict]:
     bundle = _load("fraud_model.joblib")
-    model = bundle["model"]
-    cols = bundle["feature_cols"]
-    df = add_features(pd.DataFrame(records)).replace([np.inf, -np.inf], np.nan)
-    x = df.reindex(columns=cols)
-    proba = model.predict_proba(x)[:, 1]
+
+    if bundle.get("type") == "fraud_deep":
+        import tensorflow as tf
+        model    = tf.keras.models.load_model(bundle["model_path"])
+        scaler   = bundle["scaler"]
+        cols     = bundle["feature_cols"]
+        n_steps  = bundle["n_steps"]
+        fps      = bundle["features_per_step"]
+        df = add_features(pd.DataFrame(records)).replace([np.inf, -np.inf], np.nan)
+        x = df.reindex(columns=cols).fillna(0).values.astype(np.float32)
+        x_sc = scaler.transform(x)
+        x_3d = x_sc[:, : n_steps * fps].reshape(-1, n_steps, fps)
+        proba = model.predict(x_3d, batch_size=512, verbose=0).ravel()
+    else:
+        model = bundle["model"]
+        cols  = bundle["feature_cols"]
+        df = add_features(pd.DataFrame(records)).replace([np.inf, -np.inf], np.nan)
+        x = df.reindex(columns=cols)
+        proba = model.predict_proba(x)[:, 1]
+
     return [
         {
-            "customer_id": records[i].get("customer_id"),
+            "customer_id":      records[i].get("customer_id"),
             "fraud_probability": float(proba[i]),
-            "fraud_pred": int(proba[i] >= 0.5),
+            "fraud_pred":        int(proba[i] >= 0.5),
         }
         for i in range(len(records))
     ]

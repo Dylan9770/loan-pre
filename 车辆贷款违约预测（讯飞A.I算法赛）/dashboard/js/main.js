@@ -17,9 +17,10 @@ const ECHOICEBAR_COLOR = ['#34a853', '#1a73e8', '#f9ab00', '#f57c00', '#ea4335']
 
 /* ---------- 工具函数 ---------- */
 function fmtMoney(v) {
-  if (v >= 10000) return (v / 10000).toFixed(1) + '亿';
-  if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
-  return String(v);
+  const n = Number(v) || 0;
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿元';
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + '万元';
+  return n.toLocaleString('zh-CN') + '元';
 }
 
 function fmtPct(v, decimals = 2) {
@@ -52,7 +53,7 @@ function initCharts() {
 function renderKPICards(data) {
   const d = data || MockData.overview;
   document.getElementById('kpiTotalCustomers').textContent = fmtNum(d.total_customers || 0);
-  document.getElementById('kpiTotalAmount').textContent = fmtMoney(d.total_amount || 0) + '元';
+  document.getElementById('kpiTotalAmount').textContent = fmtMoney(d.total_amount || 0);
   document.getElementById('kpiOverdueRate').textContent = fmtPct(d.overdue_rate || 0);
   document.getElementById('kpiNewCustomers').textContent = fmtNum(d.new_customers || 0);
 }

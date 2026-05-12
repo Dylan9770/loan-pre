@@ -71,6 +71,10 @@ const API = {
     return this.get('/stats/credit_score_dist');
   },
 
+  async statsRecentDecisions() {
+    return this.get('/stats/recent_decisions');
+  },
+
   /* ---------- 预测接口 ---------- */
   async predictDefault(records) {
     return this.post('/predict/default', records);
@@ -124,8 +128,8 @@ const API = {
 const MockData = {
   overview: {
     total_customers: 2263847,
-    total_amount: 158.24,
-    overdue_rate: 5.82,
+    total_amount: 15824000000,
+    overdue_rate: 0.0582,
     new_customers: 12458,
   },
 

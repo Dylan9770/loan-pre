@@ -55,6 +55,148 @@ def fetch_realtime_summary() -> dict:
         conn.close()
 
 
+def fetch_dashboard_overview() -> dict | None:
+    """Compute real KPI numbers from customer_profile + loan_fact.
+
+    Returns: total_customers, total_amount(元), overdue_rate(0~1), defaulted_customers.
+    """
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_customers,
+                    SUM(CASE WHEN loan_default = 1 THEN 1 ELSE 0 END) AS defaulted_customers,
+                    AVG(CASE WHEN loan_default = 1 THEN 1 ELSE 0 END) AS overdue_rate
+                FROM customer_profile
+                """
+            )
+            cp = cur.fetchone() or {}
+            cur.execute("SELECT COALESCE(SUM(disbursed_amount), 0) AS total_amount FROM loan_fact")
+            lf = cur.fetchone() or {}
+        return {
+            "total_customers": int(cp.get("total_customers") or 0),
+            "defaulted_customers": int(cp.get("defaulted_customers") or 0),
+            "overdue_rate": round(float(cp.get("overdue_rate") or 0), 4),
+            "total_amount": float(lf.get("total_amount") or 0),
+        }
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def fetch_cluster_samples(limit: int = 500) -> list[dict]:
+    """Sample real (credit_score, disbursed_amount, loan_default) tuples for the cluster chart."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT c.credit_score, l.disbursed_amount, l.loan_default
+                FROM customer_profile c
+                JOIN loan_fact l ON c.customer_id = l.customer_id
+                WHERE c.credit_score > 0 AND l.disbursed_amount > 0
+                ORDER BY c.customer_id
+                LIMIT {int(limit)}
+                """
+            )
+            return [dict(r) for r in cur.fetchall() or []]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def fetch_recent_real_customers(limit: int = 10) -> list[dict]:
+    """Return a batch of real customer records (profile + loan fields) for online scoring."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT c.customer_id, c.age, c.employment_type, c.credit_score,
+                       c.area_id, l.disbursed_amount, l.asset_cost, l.ltv_ratio,
+                       l.total_disbursed_loan, l.total_monthly_payment,
+                       l.total_overdue_no, l.total_outstanding_loan
+                FROM customer_profile c
+                JOIN loan_fact l ON c.customer_id = l.customer_id
+                WHERE c.credit_score > 0 AND l.disbursed_amount > 0
+                ORDER BY c.updated_at DESC, c.customer_id DESC
+                LIMIT {int(limit)}
+                """
+            )
+            return [dict(r) for r in cur.fetchall() or []]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def fetch_customer_loan_facts(customer_id: int) -> dict | None:
+    """Fetch loan_fact row for a customer (most recent disbursed_date)."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT customer_id, disbursed_date, disbursed_amount, asset_cost,
+                       ltv_ratio, total_disbursed_loan, total_monthly_payment,
+                       total_overdue_no, total_outstanding_loan, loan_default,
+                       area_id
+                FROM loan_fact
+                WHERE customer_id = %s
+                ORDER BY disbursed_date DESC
+                LIMIT 1
+                """,
+                (customer_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def fetch_recent_decisions(limit: int = 10) -> list[dict]:
+    """Fetch latest realtime decisions, newest first."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_RT)
+    except Exception:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT customer_id, default_probability, credit_score,
+                       predicted_limit, fraud_probability, created_at
+                FROM realtime_decisions
+                ORDER BY created_at DESC
+                LIMIT {int(limit)}
+                """
+            )
+            rows = cur.fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
 def fetch_customer_profile(customer_id: int) -> dict | None:
     """Fetch customer basic info from MySQL. Returns None if not found."""
     conn = _connect(Settings.MYSQL_DB_ODS)

@@ -128,16 +128,33 @@ function renderDecisionResult(profile) {
   const el = document.getElementById('decisionResult');
   if (!el) return;
 
-  const defaultProb = profile.loan_default === 1 ? 0.67 : 0.12;
-  const fraudProb = profile.loan_default === 1 ? 0.15 : 0.03;
-  const creditScore = profile.credit_score || 650;
+  // 优先用后端真实预测结果（profile 已展平了 decision 字段）
+  const hasReal = profile.default_probability != null || profile.fraud_probability != null;
+  const defaultProb = profile.default_probability != null
+    ? Number(profile.default_probability)
+    : (profile.loan_default === 1 ? 0.67 : 0.12);
+  const fraudProb = profile.fraud_probability != null
+    ? Number(profile.fraud_probability)
+    : (profile.loan_default === 1 ? 0.15 : 0.03);
+  const creditScore = Math.round(Number(profile.credit_score) || 650);
+  const predictedLimit = profile.predicted_limit != null
+    ? Number(profile.predicted_limit)
+    : Number(profile.disbursed_amount || 0);
+
+  const fmtAmount = (v) => {
+    if (v >= 1e8) return (v / 1e8).toFixed(2) + '亿元';
+    if (v >= 1e4) return (v / 1e4).toFixed(1) + '万元';
+    return Number(v).toLocaleString('zh-CN') + '元';
+  };
 
   const decisionData = [
-    { label: '违约概率', value: (defaultProb * 100).toFixed(1) + '%', cls: defaultProb > 0.5 ? 'text-danger' : 'text-success', bg: defaultProb > 0.5 ? '#fce8e6' : '#e6f4ea' },
+    { label: '违约概率', value: (defaultProb * 100).toFixed(1) + '%', cls: defaultProb > 0.5 ? 'text-danger' : defaultProb > 0.3 ? 'text-warning' : 'text-success', bg: defaultProb > 0.5 ? '#fce8e6' : '#e6f4ea' },
     { label: '信用评分', value: creditScore, cls: creditScore >= 700 ? 'text-success' : creditScore >= 550 ? 'text-warning' : 'text-danger', bg: '#e8f0fe' },
-    { label: '预测额度', value: (profile.disbursed_amount || 0).toLocaleString('zh-CN') + '元', cls: '', bg: '#e6f4ea' },
-    { label: '欺诈概率', value: (fraudProb * 100).toFixed(1) + '%', cls: fraudProb > 0.1 ? 'text-warning' : 'text-success', bg: '#fef7e0' },
+    { label: '预测额度', value: fmtAmount(predictedLimit), cls: '', bg: '#e6f4ea' },
+    { label: '欺诈概率', value: (fraudProb * 100).toFixed(1) + '%', cls: fraudProb > 0.5 ? 'text-danger' : fraudProb > 0.1 ? 'text-warning' : 'text-success', bg: '#fef7e0' },
   ];
+
+  el.dataset.source = hasReal ? 'model' : 'fallback';
 
   el.innerHTML = decisionData.map(d => `
     <div class="decision-item" style="background:${d.bg};">
@@ -304,31 +321,46 @@ async function searchCustomer() {
     API.customerLoanHistory(id).catch(() => null),
   ]);
 
-  // 如果API失败，生成mock数据
-  const mockProfile = profile || MockCustomerProfiles[id] || {
-    customer_id: id,
-    age: 35 + (id % 20),
-    employment_type: id % 3,
-    area: ['华东区', '华北区', '华南区'][id % 3],
-    credit_score: 500 + (id % 350),
-    disbursed_amount: 10000 + (id % 80000),
-    total_overdue_no: id % 4,
-    total_account_loan_no: 1 + (id % 6),
-    loan_default: id % 5 === 0 ? 1 : 0,
-    loan_asset_ratio: 0.6 + (id % 40) / 100,
-    recent_default_rate: (id % 5) / 10,
-  };
+  // API 返回嵌套结构 { customer_id, profile:{...}, decision:{...}, radar_scores:{...} }
+  // 将其展平为渲染函数所需的平铺对象
+  let flatProfile;
+  if (profile && profile.profile) {
+    flatProfile = {
+      customer_id: profile.customer_id,
+      ...profile.profile,
+      ...profile.decision,
+      radar_scores: profile.radar_scores,
+    };
+  } else {
+    // API失败时使用 mock 数据
+    flatProfile = MockCustomerProfiles[id] || {
+      customer_id: id,
+      age: 35 + (id % 20),
+      employment_type: id % 3,
+      area_id: id % 10,
+      credit_score: 500 + (id % 350),
+      disbursed_amount: 10000 + (id % 80000),
+      total_overdue_no: id % 4,
+      total_account_loan_no: 1 + (id % 6),
+      loan_default: id % 5 === 0 ? 1 : 0,
+      loan_asset_ratio: 0.6 + (id % 40) / 100,
+      recent_default_rate: (id % 5) / 10,
+    };
+  }
+
+  // 时间轴：API 返回 { events:[...] }，渲染函数需要数组
+  const timelineEvents = (timeline && timeline.events) ? timeline.events : (timeline || MockLoanTimeline);
 
   // 显示内容
   document.getElementById('profileContent').style.display = 'block';
   document.getElementById('noProfileState').style.display = 'none';
 
-  renderCustomerInfo(mockProfile);
-  renderRadarChart(mockProfile);
-  renderDecisionResult(mockProfile);
-  renderShapForce(mockProfile);
-  renderSimilarCustomers(mockProfile, similar);
-  renderTimeline(timeline);
+  renderCustomerInfo(flatProfile);
+  renderRadarChart(flatProfile);
+  renderDecisionResult(flatProfile);
+  renderShapForce(flatProfile);
+  renderSimilarCustomers(flatProfile, similar);
+  renderTimeline(timelineEvents);
 
   // 调整图表大小
   setTimeout(() => {
