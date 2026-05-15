@@ -129,6 +129,14 @@ const API = {
     return this.get('/model/shap_values');
   },
 
+  async modelShapWaterfallSamples() {
+    return this.get('/model/shap_waterfall_samples');
+  },
+
+  async modelComparison() {
+    return this.get('/model/comparison');
+  },
+
   async modelRegistry() {
     return this.get('/model/registry');
   },

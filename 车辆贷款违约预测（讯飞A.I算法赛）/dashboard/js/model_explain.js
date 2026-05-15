@@ -1,5 +1,5 @@
 /* ================================================
-   模型解释页面 - SHAP可视化与模型性能分析
+   模型解释页面 - 真实 SHAP 与多模型对比
    ================================================ */
 
 const CHART_COLORS = {
@@ -10,88 +10,24 @@ const CHART_COLORS = {
   purple: '#9334e6',
 };
 
-/* ---------- Mock SHAP 数据 ---------- */
-const MockShapData = [
-  { name: 'credit_score', display: '信用评分', mean_abs_shap: 4.52, impact: '负向', description: '信用评分越高，违约风险越低。750分以上客户违约率低于2%。' },
-  { name: 'total_overdue_no', display: '总逾期次数', mean_abs_shap: 3.87, impact: '正向', description: '逾期次数越多，违约风险显著上升。逾期3次以上是高危信号。' },
-  { name: 'outstanding_disburse_ratio', display: '未偿发放比', mean_abs_shap: 3.21, impact: '正向', description: '未偿金额占发放金额比例越高，说明还款压力越大。' },
-  { name: 'ltv_ratio', display: '贷款资产比', mean_abs_shap: 2.95, impact: '正向', description: 'LTV>0.9表示抵押物价值不足以覆盖贷款，高风险。' },
-  { name: 'overdue_rate_total', display: '总逾期率', mean_abs_shap: 2.68, impact: '正向', description: '历史逾期率超过10%的客户，违约概率显著增加。' },
-  { name: 'credit_history', display: '信用记录时长', mean_abs_shap: 2.34, impact: '负向', description: '信用历史越长（3年以上），违约风险越低，体现稳定性。' },
-  { name: 'enquirie_no', display: '征信查询次数', mean_abs_shap: 2.01, impact: '正向', description: '近3个月查询超过5次，可能存在多头借贷，信用紧张。' },
-  { name: 'disbursed_amount', display: '贷款金额', mean_abs_shap: 1.87, impact: '正向', description: '大额贷款违约成本高，但绝对值不是主要风险因子。' },
-  { name: 'age', display: '年龄', mean_abs_shap: 1.65, impact: '负向', description: '35-50岁客户违约率最低，过于年轻（<25）或年长（>60）风险略高。' },
-  { name: 'total_monthly_payment', display: '月供金额', mean_abs_shap: 1.43, impact: '正向', description: '月供占收入比超过40%时，还款压力显著增加。' },
-  { name: 'employment_type', display: '工作类型', mean_abs_shap: 1.28, impact: '负向', description: '受薪员工（salaried）比自雇人士（self-employed）违约率低约15%。' },
-  { name: 'area_id', display: '地区', mean_abs_shap: 1.15, impact: '正向', description: '部分地区（如华西区）违约率偏高，与当地经济环境相关。' },
-];
-
-/* ---------- Mock 单客户 Waterfall 数据 ---------- */
-const MockWaterfallData = [
-  { name: '信用评分(高)', value: -0.22, base: false },
-  { name: '逾期次数(多)', value: 0.18, base: false },
-  { name: '月供压力(中等)', value: 0.08, base: false },
-  { name: '信用历史(长)', value: -0.06, base: false },
-  { name: '贷款金额(大)', value: 0.05, base: false },
-  { name: '年龄(适中)', value: -0.03, base: false },
-  { name: '其他因素', value: 0.01, base: false },
-  { name: 'Base Rate', value: 0.5, base: true },
-];
-
-/* ---------- Mock 模型对比数据 ---------- */
-const MockModelCompare = {
-  models: [
-    { name: 'XGBoost', auc: 0.873, precision: 0.820, recall: 0.790, f1: 0.800, speed: 'Fast', color: '#1a73e8' },
-    { name: 'LightGBM', auc: 0.869, precision: 0.815, recall: 0.785, f1: 0.795, speed: 'Fastest', color: '#34a853' },
-    { name: 'CatBoost', auc: 0.862, precision: 0.808, recall: 0.780, f1: 0.788, speed: 'Medium', color: '#9334e6' },
-    { name: 'RandomForest', auc: 0.841, precision: 0.790, recall: 0.760, f1: 0.770, speed: 'Medium', color: '#f9ab00' },
-    { name: 'LogisticReg', auc: 0.795, precision: 0.740, recall: 0.710, f1: 0.720, speed: 'Fastest', color: '#5f6368' },
-  ],
+/* 模型名 → 中文显示名 + 速度标签（用于多模型对比表） */
+const FRAUD_MODEL_META = {
+  tabnet:        { display: 'TabNet',     speed: '深度学习', color: '#1a73e8' },
+  random_forest: { display: '随机森林',   speed: '集成树',   color: '#34a853' },
+  decision_tree: { display: '决策树',     speed: '单棵树',   color: '#f9ab00' },
 };
 
-/* ---------- Mock 决策案例 ---------- */
-const MockDecisionCases = [
-  {
-    caseId: 1,
-    result: 'approve',
-    label: '建议批准',
-    customerId: 100021,
-    defaultProb: 0.08,
-    creditScore: 768,
-    disbursedAmount: 35000,
-    totalOverdue: 0,
-    reason: '客户信用评分768分，历史上无逾期记录，贷款金额在合理范围内。相似客户群体中92%正常还款。建议批准，可提供优惠利率。',
-  },
-  {
-    caseId: 2,
-    result: 'caution',
-    label: '审慎批准',
-    customerId: 100045,
-    defaultProb: 0.35,
-    creditScore: 625,
-    disbursedAmount: 18000,
-    totalOverdue: 1,
-    reason: '客户信用评分625分处于中等水平，有1次轻微逾期记录。近期有2次贷款申请查询。建议审慎批准，降低额度或要求增加担保。',
-  },
-  {
-    caseId: 3,
-    result: 'reject',
-    label: '建议拒绝',
-    customerId: 100078,
-    defaultProb: 0.72,
-    creditScore: 480,
-    disbursedAmount: 25000,
-    totalOverdue: 4,
-    reason: '客户信用评分仅480分，历史逾期4次（含1次严重逾期），近6个月新增2笔贷款。相似客户中75%发生违约。建议拒绝。',
-  },
-];
+const DEFAULT_MODEL_META = {
+  xgboost_regressor: { display: 'XGBoost', speed: '梯度提升', color: '#1a73e8' },
+  bilstm:            { display: 'BiLSTM',  speed: '深度学习', color: '#9334e6' },
+  mlp:               { display: 'MLP',     speed: '深度学习', color: '#34a853' },
+};
 
 /* ---------- SHAP 特征重要性条形图 ---------- */
 function renderShapBarChart(data) {
   const chart = echarts.init(document.getElementById('chartShapBar'));
   if (!chart) return;
-
-  const d = (data || MockShapData).slice(0, 12).reverse();
+  const d = data.slice(0, 12).reverse();
 
   chart.setOption({
     backgroundColor: 'transparent',
@@ -110,30 +46,20 @@ function renderShapBarChart(data) {
     },
     series: [{
       type: 'bar',
-      data: d.map((x, i) => ({
+      data: d.map((x) => ({
         value: x.mean_abs_shap,
-        itemStyle: {
-          color: x.impact === '负向' ? '#34a853' : '#ea4335',
-        },
+        itemStyle: { color: x.impact === '负向' ? '#34a853' : '#ea4335' },
       })),
       barMaxWidth: 22,
-      label: {
-        show: true,
-        position: 'right',
-        formatter: (p) => p.value.toFixed(2),
-        fontSize: 10,
-        color: '#6b7785',
-      },
+      label: { show: true, position: 'right', formatter: (p) => p.value.toFixed(2), fontSize: 10, color: '#6b7785' },
     }],
   });
 }
 
-/* ---------- 模型对比图表 ---------- */
-function renderModelCompareChart(data) {
+/* ---------- 多模型对比图（欺诈分类指标） ---------- */
+function renderModelCompareChart(fraudModels) {
   const chart = echarts.init(document.getElementById('chartModelCompare'));
-  if (!chart) return;
-
-  const models = (data || MockModelCompare).models;
+  if (!chart || !fraudModels || !fraudModels.length) return;
 
   chart.setOption({
     backgroundColor: 'transparent',
@@ -141,24 +67,20 @@ function renderModelCompareChart(data) {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
       formatter: (params) => {
-        const m = models[params[0].dataIndex];
-        return `<b>${m.name}</b><br/>
+        const m = fraudModels[params[0].dataIndex];
+        const meta = FRAUD_MODEL_META[m.name] || { display: m.name };
+        return `<b>${meta.display}</b><br/>
           AUC: ${m.auc.toFixed(3)}<br/>
           精确率: ${m.precision.toFixed(3)}<br/>
           召回率: ${m.recall.toFixed(3)}<br/>
           F1: ${m.f1.toFixed(3)}`;
       },
     },
-    legend: {
-      bottom: 0,
-      itemWidth: 10,
-      itemHeight: 10,
-      textStyle: { fontSize: 10 },
-    },
+    legend: { bottom: 0, itemWidth: 10, itemHeight: 10, textStyle: { fontSize: 10 } },
     grid: { top: 10, right: 10, bottom: 40, left: 10 },
     xAxis: {
       type: 'category',
-      data: models.map(m => m.name),
+      data: fraudModels.map(m => (FRAUD_MODEL_META[m.name] || {}).display || m.name),
       axisLabel: { fontSize: 10, color: '#6b7785' },
       axisLine: { lineStyle: { color: '#e0e4e8' } },
     },
@@ -169,82 +91,111 @@ function renderModelCompareChart(data) {
       splitLine: { lineStyle: { color: '#f0f0f0' } },
     },
     series: [
-      { name: 'AUC', type: 'bar', data: models.map(m => m.auc), itemStyle: { color: '#1a73e8' }, barMaxWidth: 25 },
-      { name: '精确率', type: 'bar', data: models.map(m => m.precision), itemStyle: { color: '#34a853' }, barMaxWidth: 25 },
-      { name: '召回率', type: 'bar', data: models.map(m => m.recall), itemStyle: { color: '#f9ab00' }, barMaxWidth: 25 },
+      { name: 'AUC',     type: 'bar', data: fraudModels.map(m => m.auc),       itemStyle: { color: '#1a73e8' }, barMaxWidth: 25 },
+      { name: '精确率', type: 'bar', data: fraudModels.map(m => m.precision), itemStyle: { color: '#34a853' }, barMaxWidth: 25 },
+      { name: '召回率', type: 'bar', data: fraudModels.map(m => m.recall),    itemStyle: { color: '#f9ab00' }, barMaxWidth: 25 },
     ],
   });
 }
 
-/* ---------- 模型对比表格 ---------- */
-function renderModelCompareTable(data) {
+/* ---------- 多模型对比表（欺诈 + 违约 两套指标各一行小表） ---------- */
+function renderModelCompareTable(comparison) {
   const tbody = document.getElementById('modelCompareTable');
   if (!tbody) return;
 
-  const models = (data || MockModelCompare).models;
-  tbody.innerHTML = models.map((m, i) => `
-    <tr class="${i === 0 ? 'best-cell' : ''}">
-      <td>${i === 0 ? '<b>' + m.name + ' &#x2605;</b>' : m.name}</td>
-      <td>${m.auc.toFixed(3)}</td>
-      <td>${m.precision.toFixed(3)}</td>
-      <td>${m.recall.toFixed(3)}</td>
-      <td>${m.f1.toFixed(3)}</td>
-      <td><span class="badge badge-info">${m.speed}</span></td>
-    </tr>
-  `).join('');
+  const fraudRows = (comparison.fraud || [])
+    .slice()
+    .sort((a, b) => (b.is_winner ? 1 : 0) - (a.is_winner ? 1 : 0))
+    .map((m) => {
+      const meta = FRAUD_MODEL_META[m.name] || { display: m.name, speed: '-' };
+      return `<tr class="${m.is_winner ? 'best-cell' : ''}">
+        <td>${m.is_winner ? '<b>' + meta.display + ' &#x2605;</b>' : meta.display}</td>
+        <td>${m.auc.toFixed(3)}</td>
+        <td>${m.precision.toFixed(3)}</td>
+        <td>${m.recall.toFixed(3)}</td>
+        <td>${m.f1.toFixed(3)}</td>
+        <td><span class="badge badge-info">${meta.speed}</span></td>
+      </tr>`;
+    }).join('');
+
+  const defaultRows = (comparison.default || [])
+    .slice()
+    .sort((a, b) => (b.is_winner ? 1 : 0) - (a.is_winner ? 1 : 0))
+    .map((m) => {
+      const meta = DEFAULT_MODEL_META[m.name] || { display: m.name, speed: '-' };
+      return `<tr class="${m.is_winner ? 'best-cell' : ''}">
+        <td>${m.is_winner ? '<b>' + meta.display + ' &#x2605;</b>' : meta.display}</td>
+        <td colspan="2" style="text-align:center;color:#6b7785;font-size:11px;">R² ${m.r2.toFixed(3)}</td>
+        <td colspan="2" style="text-align:center;color:#6b7785;font-size:11px;">RMSE ${m.rmse.toFixed(2)}</td>
+        <td><span class="badge badge-info">${meta.speed}</span></td>
+      </tr>`;
+    }).join('');
+
+  tbody.innerHTML = `
+    <tr><td colspan="6" style="background:#f5f7fa;font-weight:600;font-size:12px;color:#5f6368;">
+      欺诈检测（分类指标）</td></tr>
+    ${fraudRows}
+    <tr><td colspan="6" style="background:#f5f7fa;font-weight:600;font-size:12px;color:#5f6368;">
+      违约预测（回归指标，R² / RMSE）</td></tr>
+    ${defaultRows}
+  `;
 }
 
-/* ---------- SHAP Waterfall Chart ---------- */
-function renderShapWaterfall(data) {
+/* ---------- SHAP Waterfall Chart（单客户解释） ---------- */
+function renderShapWaterfall(sample) {
   const chart = echarts.init(document.getElementById('chartShapWaterfall'));
-  if (!chart) return;
+  if (!chart || !sample) return;
 
-  const d = data || MockWaterfallData;
+  // sample: { label, credit_score, p_default, base_value, items: [{display, value}] }
+  const items = sample.items;
+  const base  = sample.base_value;
 
-  let cumValue = 0;
+  let cumValue = base;
   const waterfallData = [];
-  const labels = [];
+  const labels = ['Base'];
+  // base bar
+  waterfallData.push({ value: [0, 0, base, base], itemStyle: { color: '#6b7785' } });
 
-  // Build waterfall bars
-  d.forEach((item, i) => {
-    if (item.base) {
-      waterfallData.push({ value: [i, 0, item.value, item.value], itemStyle: { color: '#6b7785' } });
-      cumValue = item.value;
+  items.forEach((item, i) => {
+    const idx = i + 1;
+    if (item.value >= 0) {
+      waterfallData.push({ value: [idx, cumValue, cumValue + item.value, item.value],
+                            itemStyle: { color: '#ea4335' } });
     } else {
-      if (item.value >= 0) {
-        waterfallData.push({ value: [i, cumValue, cumValue + item.value, item.value], itemStyle: { color: '#ea4335' } });
-      } else {
-        waterfallData.push({ value: [i, cumValue + item.value, cumValue, item.value], itemStyle: { color: '#34a853' } });
-      }
-      cumValue += item.value;
+      waterfallData.push({ value: [idx, cumValue + item.value, cumValue, item.value],
+                            itemStyle: { color: '#34a853' } });
     }
-    labels.push(item.name);
+    cumValue += item.value;
+    labels.push(item.display || item.name);
   });
 
-  // Final prediction
-  waterfallData.push({ value: [d.length, 0, cumValue, cumValue], itemStyle: { color: cumValue > 0.5 ? '#ea4335' : '#34a853' } });
-  labels.push('预测');
+  // Final prediction bar
+  waterfallData.push({ value: [items.length + 1, 0, cumValue, cumValue],
+                        itemStyle: { color: cumValue < 600 ? '#ea4335' : '#34a853' } });
+  labels.push(`预测=${cumValue.toFixed(0)}`);
 
   chart.setOption({
     backgroundColor: 'transparent',
     tooltip: {
       formatter: (p) => {
-        const item = d[p.dataIndex < d.length ? p.dataIndex : d.length - 1];
-        if (!item) return '';
-        const sign = item.value >= 0 ? '+' : '';
-        return `<b>${item.name}</b><br/>贡献: <b style="color:${item.value >= 0 ? '#ea4335' : '#34a853'}">${sign}${item.value.toFixed(3)}</b>`;
+        const i = p.dataIndex;
+        if (i === 0) return `<b>Base value</b><br/>训练集平均评分: <b>${base.toFixed(1)}</b>`;
+        if (i === items.length + 1) return `<b>最终预测</b><br/>评分: <b>${cumValue.toFixed(1)}</b><br/>P(违约): <b>${sample.p_default}</b>`;
+        const it = items[i - 1];
+        const sign = it.value >= 0 ? '+' : '';
+        return `<b>${it.display || it.name}</b><br/>SHAP贡献: <b style="color:${it.value >= 0 ? '#ea4335' : '#34a853'}">${sign}${it.value.toFixed(2)}</b>`;
       },
     },
-    grid: { top: 10, right: 60, bottom: 30, left: 60 },
+    grid: { top: 10, right: 60, bottom: 50, left: 60 },
     xAxis: {
       type: 'category',
       data: labels,
-      axisLabel: { fontSize: 9, color: '#6b7785', rotate: 30 },
+      axisLabel: { fontSize: 9, color: '#6b7785', rotate: 30, interval: 0 },
       axisLine: { lineStyle: { color: '#e0e4e8' } },
     },
     yAxis: {
       type: 'value',
-      axisLabel: { fontSize: 10, formatter: (v) => v.toFixed(1), color: '#6b7785' },
+      axisLabel: { fontSize: 10, formatter: (v) => v.toFixed(0), color: '#6b7785' },
       splitLine: { lineStyle: { color: '#f0f0f0' } },
     },
     series: [{
@@ -268,33 +219,33 @@ function renderShapWaterfall(data) {
   });
 }
 
-/* ---------- SHAP Waterfall Detail ---------- */
-function renderShapWaterfallDetail(data) {
+/* ---------- SHAP Waterfall 详情列表 ---------- */
+function renderShapWaterfallDetail(sample) {
   const el = document.getElementById('shapWaterfallDetail');
-  if (!el) return;
-
-  const d = (data || MockWaterfallData).filter(x => !x.base);
-
-  el.innerHTML = d.map(item => {
+  if (!el || !sample) return;
+  // 顶部加一行样本元信息
+  const meta = `<div style="margin-bottom:8px;padding:8px 10px;background:#f5f7fa;border-radius:4px;font-size:12px;">
+      <b>${sample.label}</b> &nbsp; 评分=${sample.credit_score} &nbsp; P(违约)=${(sample.p_default * 100).toFixed(1)}%
+    </div>`;
+  el.innerHTML = meta + sample.items.map(item => {
     const isPos = item.value > 0;
+    const absScaled = Math.min(50, Math.abs(item.value) * 4);   // 评分量纲，调比例
     return `<div class="shap-bar-row">
-      <span class="shap-bar-label">${item.name}</span>
+      <span class="shap-bar-label">${item.display || item.name}</span>
       <div class="shap-bar-track">
         <div class="shap-bar-fill ${isPos ? 'positive' : 'negative'}"
-             style="width:${Math.min(50, Math.abs(item.value) * 100)}%;${isPos ? 'right:auto;left:50%;' : 'left:auto;right:50%;'}"></div>
+             style="width:${absScaled}%;${isPos ? 'right:auto;left:50%;' : 'left:auto;right:50%;'}"></div>
       </div>
-      <span class="shap-bar-value" style="color:${isPos ? '#ea4335' : '#34a853'};">${isPos ? '+' : ''}${item.value.toFixed(2)}</span>
+      <span class="shap-bar-value" style="color:${isPos ? '#ea4335' : '#34a853'};">${isPos ? '+' : ''}${item.value.toFixed(1)}</span>
     </div>`;
   }).join('');
 }
 
-/* ---------- 特征影响详情列表 ---------- */
+/* ---------- 特征影响详情列表 Top8 ---------- */
 function renderShapDetailList(data) {
   const el = document.getElementById('shapDetailList');
   if (!el) return;
-
-  const d = (data || MockShapData).slice(0, 8);
-
+  const d = data.slice(0, 8);
   el.innerHTML = d.map(item => `
     <div class="shap-detail-item">
       <div class="shap-detail-header">
@@ -306,80 +257,140 @@ function renderShapDetailList(data) {
           ${item.impact === '负向' ? '降低风险' : '增加风险'}
         </div>
       </div>
-      <div class="shap-detail-desc">${item.description}</div>
+      <div class="shap-detail-desc">${item.description || ''}</div>
     </div>
   `).join('');
 }
 
-/* ---------- 决策案例卡片 ---------- */
-function renderDecisionCases(data) {
+/* ---------- 决策案例卡片（接 /stats/recent_decisions） ---------- */
+function renderDecisionCases(decisions) {
   const el = document.getElementById('decisionCases');
   if (!el) return;
+  if (!decisions || !decisions.length) {
+    el.innerHTML = '<div class="card-body" style="text-align:center;color:#6b7785;">暂无最近决策记录</div>';
+    return;
+  }
+  // 取低/中/高三档（按 default_probability 排序后挑代表）
+  const sorted = decisions.slice().sort((a, b) =>
+    (a.default_probability || 0) - (b.default_probability || 0));
+  const picks = sorted.length >= 3
+    ? [sorted[0], sorted[Math.floor(sorted.length / 2)], sorted[sorted.length - 1]]
+    : sorted;
 
-  const d = data || MockDecisionCases;
+  el.innerHTML = picks.map((c, idx) => {
+    const p = c.default_probability || 0;
+    const result = p < 0.25 ? 'approve' : p > 0.55 ? 'reject' : 'caution';
+    const label  = result === 'approve' ? '建议批准'
+                 : result === 'reject'  ? '建议拒绝' : '审慎批准';
+    const badgeCls = result === 'approve' ? 'badge-success'
+                    : result === 'reject' ? 'badge-danger' : 'badge-warning';
+    const reason = result === 'approve'
+      ? `客户信用评分 ${c.credit_score} 较高，违约概率仅 ${(p*100).toFixed(1)}%；欺诈概率 ${((c.fraud_probability||0)*100).toFixed(1)}%。建议批准，可参考额度 ${(c.predicted_limit||0).toLocaleString()} 元。`
+      : result === 'reject'
+        ? `客户信用评分 ${c.credit_score} 偏低，违约概率高达 ${(p*100).toFixed(1)}%；建议拒绝或要求增强担保。`
+        : `客户信用评分 ${c.credit_score} 居中，违约概率 ${(p*100).toFixed(1)}%；欺诈概率 ${((c.fraud_probability||0)*100).toFixed(1)}%。建议审慎批准，可适度降低额度。`;
 
-  el.innerHTML = d.map(c => {
-    const resultClass = c.result === 'approve' ? 'approve' : c.result === 'reject' ? 'reject' : 'caution';
-    const resultBadge = c.result === 'approve'
-      ? '<span class="badge badge-success">建议批准</span>'
-      : c.result === 'reject'
-        ? '<span class="badge badge-danger">建议拒绝</span>'
-        : '<span class="badge badge-warning">审慎批准</span>';
-
-    return `<div class="decision-case ${resultClass}">
+    return `<div class="decision-case ${result}">
       <div class="case-header">
-        <div class="case-title">案例 #${c.caseId} - 客户 ${c.customerId}</div>
-        ${resultBadge}
+        <div class="case-title">案例 #${idx + 1} - 客户 ${c.customer_id}</div>
+        <span class="badge ${badgeCls}">${label}</span>
       </div>
       <div class="case-features">
         <div class="case-feature">
           <div class="cf-label">违约概率</div>
-          <div class="cf-value" style="color:${c.defaultProb > 0.5 ? '#ea4335' : c.defaultProb > 0.3 ? '#f9ab00' : '#34a853'};">${(c.defaultProb * 100).toFixed(1)}%</div>
+          <div class="cf-value" style="color:${p > 0.5 ? '#ea4335' : p > 0.3 ? '#f9ab00' : '#34a853'};">${(p * 100).toFixed(1)}%</div>
         </div>
         <div class="case-feature">
           <div class="cf-label">信用评分</div>
-          <div class="cf-value">${c.creditScore}</div>
+          <div class="cf-value">${c.credit_score || '-'}</div>
         </div>
         <div class="case-feature">
-          <div class="cf-label">逾期次数</div>
-          <div class="cf-value" style="color:${c.totalOverdue > 2 ? '#ea4335' : '#34a853'};">${c.totalOverdue}</div>
+          <div class="cf-label">建议额度</div>
+          <div class="cf-value">${(c.predicted_limit || 0).toLocaleString()} 元</div>
         </div>
       </div>
-      <div class="case-reason">${c.reason}</div>
+      <div class="case-reason">${reason}</div>
     </div>`;
   }).join('');
 }
 
-/* ---------- 阈值调整 ---------- */
+/* ---------- 阈值调整（仅显示，未来可接 /predict 重算） ---------- */
 function updateThreshold(value) {
-  document.getElementById('thresholdDisplay').textContent = parseFloat(value).toFixed(2);
-  // 可扩展：重新计算所有预测的分类结果
+  const el = document.getElementById('thresholdDisplay');
+  if (el) el.textContent = parseFloat(value).toFixed(2);
 }
 
 /* ---------- 页面初始化 ---------- */
 let resizeTimer;
+let _waterfallSamples = [];
 
-function boot() {
-  // 加载所有图表
-  renderShapBarChart(MockShapData);
-  renderModelCompareChart(MockModelCompare);
-  renderModelCompareTable(MockModelCompare);
-  renderShapWaterfall(MockWaterfallData);
-  renderShapWaterfallDetail(MockWaterfallData);
-  renderShapDetailList(MockShapData);
-  renderDecisionCases(MockDecisionCases);
+async function boot() {
+  // 并行拉所有真实数据
+  const [shapGlobal, comparison, samples, decisions] = await Promise.all([
+    API.modelShapValues(),
+    API.modelComparison(),
+    API.modelShapWaterfallSamples(),
+    API.statsRecentDecisions(),
+  ]);
 
-  // 窗口调整
+  if (Array.isArray(shapGlobal)) {
+    renderShapBarChart(shapGlobal);
+    renderShapDetailList(shapGlobal);
+  } else {
+    console.warn('[ModelExplain] shap_global unavailable:', shapGlobal);
+  }
+
+  if (comparison && (comparison.default || comparison.fraud)) {
+    renderModelCompareChart(comparison.fraud || []);
+    renderModelCompareTable(comparison);
+  } else {
+    console.warn('[ModelExplain] comparison unavailable:', comparison);
+  }
+
+  if (Array.isArray(samples) && samples.length) {
+    _waterfallSamples = samples;
+    renderShapWaterfall(samples[0]);
+    renderShapWaterfallDetail(samples[0]);
+    _attachSampleSwitcher(samples);
+  } else {
+    console.warn('[ModelExplain] shap_samples unavailable:', samples);
+  }
+
+  renderDecisionCases(Array.isArray(decisions) ? decisions : []);
+
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-      const ids = ['chartShapBar', 'chartModelCompare', 'chartShapWaterfall'];
-      ids.forEach(id => {
+      ['chartShapBar', 'chartModelCompare', 'chartShapWaterfall'].forEach(id => {
         const inst = echarts.getInstanceByDom(document.getElementById(id));
         if (inst) inst.resize();
       });
     }, 300);
   });
+}
+
+/* 在 Waterfall 卡片上加"低/中/高风险样本"切换按钮 */
+function _attachSampleSwitcher(samples) {
+  const detailEl = document.getElementById('shapWaterfallDetail');
+  if (!detailEl) return;
+  const switcher = document.createElement('div');
+  switcher.style.cssText = 'display:flex;gap:6px;margin-bottom:8px;';
+  samples.forEach((s, i) => {
+    const btn = document.createElement('button');
+    btn.textContent = s.label;
+    btn.style.cssText = `flex:1;padding:6px;font-size:11px;border:1px solid #d0d4d8;border-radius:4px;cursor:pointer;background:${i === 0 ? '#1a73e8' : '#fff'};color:${i === 0 ? '#fff' : '#5f6368'};`;
+    btn.onclick = () => {
+      switcher.querySelectorAll('button').forEach((b, j) => {
+        b.style.background = (i === j) ? '#1a73e8' : '#fff';
+        b.style.color      = (i === j) ? '#fff' : '#5f6368';
+      });
+      renderShapWaterfall(samples[i]);
+      renderShapWaterfallDetail(samples[i]);
+    };
+    switcher.appendChild(btn);
+  });
+  // 插入到详情列表上方
+  detailEl.parentElement.insertBefore(switcher, detailEl);
 }
 
 /* ---------- 启动 ---------- */

@@ -213,19 +213,86 @@ def stats_recent_decisions():
 
 @stats_bp.get("/model/shap_values")
 def model_shap_values():
-    """Return SHAP feature importance values."""
-    return jsonify([
-        {"name": "credit_score", "display": "信用评分", "mean_abs_shap": 4.52, "impact": "负向"},
-        {"name": "total_overdue_no", "display": "总逾期次数", "mean_abs_shap": 3.87, "impact": "正向"},
-        {"name": "outstanding_disburse_ratio", "display": "未偿发放比", "mean_abs_shap": 3.21, "impact": "正向"},
-        {"name": "ltv_ratio", "display": "贷款资产比", "mean_abs_shap": 2.95, "impact": "正向"},
-        {"name": "overdue_rate_total", "display": "总逾期率", "mean_abs_shap": 2.68, "impact": "正向"},
-        {"name": "credit_history", "display": "信用记录时长", "mean_abs_shap": 2.34, "impact": "负向"},
-        {"name": "enquirie_no", "display": "征信查询次数", "mean_abs_shap": 2.01, "impact": "正向"},
-        {"name": "disbursed_amount", "display": "贷款金额", "mean_abs_shap": 1.87, "impact": "正向"},
-        {"name": "age", "display": "年龄", "mean_abs_shap": 1.65, "impact": "负向"},
-        {"name": "total_monthly_payment", "display": "月供金额", "mean_abs_shap": 1.43, "impact": "正向"},
-    ])
+    """Return real SHAP feature importance computed offline by scripts/precompute_shap.py."""
+    shap_path = _PROJECT_ROOT / "artifacts" / "shap_global.json"
+    if shap_path.exists():
+        try:
+            return jsonify(json.loads(shap_path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            return jsonify({"error": f"failed to read shap_global.json: {exc}"}), 500
+    return jsonify({"error": "shap_global.json not found; run scripts/precompute_shap.py"}), 503
+
+
+@stats_bp.get("/model/shap_waterfall_samples")
+def model_shap_waterfall_samples():
+    """Return precomputed SHAP waterfall samples (low/mid/high risk customers)."""
+    samples_path = _PROJECT_ROOT / "artifacts" / "shap_samples.json"
+    if samples_path.exists():
+        try:
+            return jsonify(json.loads(samples_path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            return jsonify({"error": f"failed to read shap_samples.json: {exc}"}), 500
+    return jsonify({"error": "shap_samples.json not found; run scripts/precompute_shap.py"}), 503
+
+
+@stats_bp.get("/model/comparison")
+def model_comparison():
+    """Return multi-model comparison from model_registry.json (single source of truth).
+
+    Both winner and non-winner rows come from registry.models.*.comparison.
+    Edit artifacts/model_registry.json to change displayed numbers; no joblib touched.
+    """
+    reg_path = _PROJECT_ROOT / "artifacts" / "model_registry.json"
+    out: dict = {"default": [], "fraud": []}
+    if not reg_path.exists():
+        return jsonify({**out, "error": "model_registry.json not found"}), 503
+
+    try:
+        reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return jsonify({**out, "error": f"failed to parse registry: {exc}"}), 500
+
+    models = reg.get("models", {})
+
+    d_node = models.get("default_model", {})
+    d_winner = d_node.get("winner", "")
+    for name, m in d_node.get("comparison", {}).items():
+        out["default"].append({
+            "name": name,
+            "is_winner": (name == d_winner),
+            "r2":   round(float(m.get("r2", 0)), 4),
+            "rmse": round(float(m.get("rmse", 0)), 2),
+            "mae":  round(float(m.get("mae", 0)), 2),
+            "mse":  round(float(m.get("mse", 0)), 2),
+        })
+
+    f_node = models.get("fraud_model", {})
+    f_winner = f_node.get("winner", "")
+    for name, m in f_node.get("comparison", {}).items():
+        out["fraud"].append({
+            "name": name,
+            "is_winner": (name == f_winner),
+            "auc":       round(float(m.get("roc_auc", 0)), 4),
+            "precision": round(float(m.get("precision", 0)), 4),
+            "recall":    round(float(m.get("recall", 0)), 4),
+            "f1":        round(float(m.get("f1", 0)), 4),
+            "pr_auc":    round(float(m.get("pr_auc", 0)), 4),
+            "threshold": round(float(m.get("threshold", 0.5)), 3),
+        })
+
+    return jsonify(out)
+
+
+@stats_bp.get("/model/registry")
+def model_registry():
+    """Return raw model_registry.json for dashboard/audit consumption."""
+    reg_path = _PROJECT_ROOT / "artifacts" / "model_registry.json"
+    if reg_path.exists():
+        try:
+            return jsonify(json.loads(reg_path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            return jsonify({"error": f"failed to read model_registry.json: {exc}"}), 500
+    return jsonify({"error": "model_registry.json not found"}), 503
 
 
 @stats_bp.get("/stats/system_metrics")
