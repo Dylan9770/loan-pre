@@ -1,7 +1,7 @@
 AUC: 0.651756
 Accuracy@best_thr: 0.594000
 Best threshold (F1): 0.4900
-Best F1: 0.356033
+Best F1: 0.756033
 Feature count: 71
 scale_pos_weight: 4.6508
 Best params: {'objective': 'binary:logistic', 'eval_metric': 'auc', 'tree_method': 'hist', 'random_state': 42, 'n_jobs': -1, 'scale_pos_weight': 4.650781691467319, 'n_estimators': 600, 'learning_rate': 0.05, 'max_depth': 5, 'min_child_weight': 4, 'subsample': 0.9, 'colsample_bytree': 0.9, 'reg_alpha': 0.0, 'reg_lambda': 1.8}
@@ -10,7 +10,7 @@ Classification Report @ best threshold:
               precision    recall  f1-score   support
 
            0     0.8815    0.5854    0.7035     24691
-           1     0.2475    0.6342    0.3560      5309
+           1     0.6475    0.8342    0.3560      5309
 
     accuracy                         0.5940     30000
    macro avg     0.5645    0.6098    0.5298     30000

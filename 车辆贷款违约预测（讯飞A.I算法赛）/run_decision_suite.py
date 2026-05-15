@@ -112,7 +112,7 @@ def run_local_pipeline(
               f"MAE={m.get('mae', 0):.2f}")
 
     if "fraud" in stages:
-        _print_header("Stage 2: Training Fraud Model (FT-Transformer / DT / RF)")
+        _print_header("Stage 2: Training Fraud Model (TabNet / DT / RF)")
         t0 = time.time()
         fraud_result = train_fraud_model(cfg, df)
         m = fraud_result["metrics"]

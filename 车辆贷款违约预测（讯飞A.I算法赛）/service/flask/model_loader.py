@@ -67,7 +67,7 @@ def predict_default(records: list[dict]) -> list[dict]:
 def predict_fraud(records: list[dict]) -> list[dict]:
     """
     欺诈检测（分类）。
-    支持三种胜出模型：ft_transformer / decision_tree / random_forest。
+    支持三种胜出模型：tabnet / decision_tree / random_forest。
     返回 fraud_probability 和 fraud_pred（按最优阈值）。
     """
     bundle     = _load("fraud_model.joblib")
@@ -78,10 +78,8 @@ def predict_fraud(records: list[dict]) -> list[dict]:
     scaler     = bundle["scaler"]
     X_sc       = scaler.transform(X.values)
 
-    if model_type == "ft_transformer":
-        import tensorflow as tf
-        model = tf.keras.models.load_model(bundle["model_path"])
-        proba = model.predict(X_sc, batch_size=512, verbose=0).ravel()
+    if model_type == "tabnet":
+        proba = bundle["model"].predict_proba(X_sc)[:, 1]
 
     elif model_type in ("decision_tree", "random_forest"):
         proba = bundle["model"].predict_proba(X_sc)[:, 1]

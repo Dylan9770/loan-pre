@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from flask import Blueprint, jsonify
 
 from service.flask.repositories.hive_repo import fetch_risk_daily_summary
@@ -14,6 +17,8 @@ from service.flask.repositories.mysql_repo import (
     fetch_recent_real_customers,
 )
 
+# 项目根目录（routes/stats.py → routes/ → flask/ → service/ → 项目根）
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 # ---- 简单内存缓存（避免每次请求都重跑模型预测） ----
 _DECISIONS_CACHE: dict = {"data": None, "ts": None}
@@ -103,7 +108,24 @@ def stats_risk_distribution():
 
 @stats_bp.get("/stats/model_metrics")
 def stats_model_metrics():
-    """Return model performance metrics."""
+    """Return model performance metrics from model_registry.json or fallback."""
+    registry_path = _PROJECT_ROOT / "artifacts" / "model_registry.json"
+    if registry_path.exists():
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            fraud_metrics = registry.get("models", {}).get("fraud_model", {}).get("metrics", {})
+            if fraud_metrics:
+                return jsonify({
+                    "auc": round(fraud_metrics.get("roc_auc", 0.873), 3),
+                    "precision": round(fraud_metrics.get("precision", 0.820), 3),
+                    "recall": round(fraud_metrics.get("recall", 0.790), 3),
+                    "f1": round(fraud_metrics.get("f1", 0.800), 3),
+                    "accuracy": round(fraud_metrics.get("accuracy", 0.815), 3),
+                    "threshold": fraud_metrics.get("threshold", 0.50),
+                })
+        except Exception:
+            pass
+
     return jsonify({
         "auc": 0.873,
         "precision": 0.820,
@@ -204,3 +226,39 @@ def model_shap_values():
         {"name": "age", "display": "年龄", "mean_abs_shap": 1.65, "impact": "负向"},
         {"name": "total_monthly_payment", "display": "月供金额", "mean_abs_shap": 1.43, "impact": "正向"},
     ])
+
+
+@stats_bp.get("/stats/system_metrics")
+def stats_system_metrics():
+    """Return real-time system operating metrics.
+
+    api_calls / avg_latency_ms come from in-memory counters tracked
+    by the Flask before_request/after_request middleware (app.py).
+    repair_success_rate is read from artifacts/repair_evaluation.json.
+
+    NOTE: we access METRICS via sys.modules['__main__'] rather than
+    'service.flask.app' because python -m causes the two module
+    identities to carry separate METRICS dictionaries.
+    """
+    import sys
+
+    main_mod = sys.modules.get("__main__")
+    m = main_mod.get_metrics() if main_mod and hasattr(main_mod, "get_metrics") else {"total_requests": 0, "total_latency_ms": 0.0}
+
+    total = m["total_requests"]
+    avg_latency = round(m["total_latency_ms"] / total, 2) if total > 0 else 0.0
+
+    repair_rate = 0.0
+    repair_path = _PROJECT_ROOT / "artifacts" / "repair_evaluation.json"
+    try:
+        if repair_path.exists():
+            repair_data = json.loads(repair_path.read_text(encoding="utf-8"))
+            repair_rate = repair_data.get("fp_growth_style", {}).get("coverage", 0.0)
+    except Exception:
+        pass
+
+    return jsonify({
+        "api_calls": total,
+        "avg_latency_ms": avg_latency,
+        "repair_success_rate": round(repair_rate, 4),
+    })

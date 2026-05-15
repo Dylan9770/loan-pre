@@ -56,23 +56,15 @@ ok "模型文件齐全 (default + fraud)"
 
 # ---- 3. 杀掉已有的 Flask 进程 ----
 info "清理已有 Flask 进程..."
-OLD_PIDS=$(pgrep -f "service.flask.app" || true)
-if [ -n "$OLD_PIDS" ]; then
-    echo "$OLD_PIDS" | xargs -r kill 2>/dev/null || true
-    sleep 1
-    OLD_PIDS=$(pgrep -f "service.flask.app" || true)
-    if [ -n "$OLD_PIDS" ]; then
-        echo "$OLD_PIDS" | xargs -r kill -9 2>/dev/null || true
-        sleep 1
-    fi
-    ok "已清理旧进程"
-else
-    ok "无残留进程"
-fi
+fuser -k $PORT/tcp 2>/dev/null || true
+sleep 2
+ok "已清理旧进程"
 
 # ---- 4. 启动 Flask ----
-info "启动 Flask 服务..."
-nohup python3 -m service.flask.app > "$LOG_FILE" 2>&1 &
+PYTHON="${SCRIPT_DIR}/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="python3"
+info "启动 Flask 服务 ($PYTHON)..."
+nohup "$PYTHON" -m service.flask.app > "$LOG_FILE" 2>&1 &
 FLASK_PID=$!
 echo "$FLASK_PID" > /tmp/flask.pid
 

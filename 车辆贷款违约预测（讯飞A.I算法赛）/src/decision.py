@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+# 必须在 TF / PyTorch 任何一个导入前设置，避免两个框架争抢 CUDA 上下文导致 segfault
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import joblib
 import numpy as np
@@ -19,8 +23,9 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier, XGBRegressor
 
@@ -507,38 +512,36 @@ def _build_fraud_label(df: pd.DataFrame) -> pd.Series:
     return (composite >= 0.30).astype(int)
 
 
-def _build_ft_transformer(n_features: int, d_token: int = 16,
-                           n_heads: int = 2, n_layers: int = 1,
-                           dropout: float = 0.1) -> tf.keras.Model:
-    """
-    FT-Transformer（Feature Tokenization Transformer）：
-    每列特征独立投影为 d_token 维 embedding，再经 Transformer Encoder 建模特征间交互。
-    比原版 Transformer 更适合表格分类任务。
-    """
-    inp = tf.keras.Input(shape=(n_features,), name="ft_input")
-    # Feature Tokenization: (batch, n_features) → (batch, n_features, d_token)
-    x = tf.keras.layers.Reshape((n_features, 1))(inp)
-    x = tf.keras.layers.Dense(d_token, use_bias=True)(x)
-
-    for _ in range(n_layers):
-        attn = tf.keras.layers.MultiHeadAttention(
-            num_heads=n_heads, key_dim=d_token // n_heads, dropout=dropout
-        )(x, x)
-        x = tf.keras.layers.Add()([x, attn])
-        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
-
-        ff = tf.keras.layers.Dense(d_token * 4, activation="gelu")(x)
-        ff = tf.keras.layers.Dropout(dropout)(ff)
-        ff = tf.keras.layers.Dense(d_token)(ff)
-        ff = tf.keras.layers.Dropout(dropout)(ff)
-        x = tf.keras.layers.Add()([x, ff])
-        x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x)
-
-    x = tf.keras.layers.GlobalAveragePooling1D()(x)
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
-    x = tf.keras.layers.Dropout(dropout)(x)
-    out = tf.keras.layers.Dense(1, activation="sigmoid", name="fraud_output")(x)
-    return tf.keras.Model(inp, out, name="ft_transformer")
+def _train_tabnet(X_tr: np.ndarray, y_tr: np.ndarray,
+                  X_val: np.ndarray, y_val: np.ndarray):
+    """TabNet — 专为表格数据设计的深度学习分类器，用稀疏注意力逐步选择特征。"""
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""   # 避免 TF/PyTorch 双框架 CUDA 上下文冲突
+    from pytorch_tabnet.tab_model import TabNetClassifier
+    clf = TabNetClassifier(
+        n_d=32, n_a=32,
+        n_steps=5,
+        gamma=1.3,
+        n_independent=2,
+        n_shared=2,
+        momentum=0.02,
+        seed=42,
+        device_name="cpu",
+        verbose=10,
+    )
+    clf.fit(
+        X_tr.astype(np.float32), y_tr.astype(int),
+        eval_set=[(X_val.astype(np.float32), y_val.astype(int))],
+        eval_metric=["auc"],
+        max_epochs=200,
+        patience=20,
+        batch_size=1024,
+        virtual_batch_size=256,
+        num_workers=0,
+        weights=1,
+        drop_last=False,
+    )
+    return clf
 
 
 def _find_best_threshold_recall(y_true: np.ndarray, y_proba: np.ndarray,
@@ -553,6 +556,19 @@ def _find_best_threshold_recall(y_true: np.ndarray, y_proba: np.ndarray,
         rec  = recall_score(y_true, y_pred, zero_division=0)
         if prec >= min_precision and rec > best_recall:
             best_recall, best_thr = rec, float(thr)
+    return best_thr
+
+
+def _find_best_threshold_f1(y_true: np.ndarray, y_proba: np.ndarray) -> float:
+    """最大化 F1 的阈值搜索——比 Recall-under-Precision 更稳定，适合小模型。"""
+    best_thr, best_f1 = 0.5, 0.0
+    for thr in np.linspace(0.05, 0.95, 181):
+        y_pred = (y_proba >= thr).astype(int)
+        if y_pred.sum() == 0:
+            continue
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, float(thr)
     return best_thr
 
 
@@ -576,7 +592,7 @@ def _eval_fraud(y_true: np.ndarray, y_proba: np.ndarray,
 def train_fraud_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
     """
     欺诈检测（分类）：
-      训练 FT-Transformer / 决策树 / 随机森林 三个模型
+      训练 TabNet / 决策树 / 随机森林 三个模型
       按 Recall/PR-AUC/F1/ROC-AUC 加权综合得分择优，保存最优模型
     """
     tf.config.threading.set_inter_op_parallelism_threads(2)
@@ -622,51 +638,44 @@ def train_fraud_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
     X_val_sc = scaler.transform(X_val)
     X_test_sc= scaler.transform(X_test)
 
+    # FT 专用：QuantileTransformer（拟合原始 X_tr，不含 SMOTE）
+    qt = QuantileTransformer(
+        n_quantiles=min(len(X_tr), 1000), output_distribution="normal", random_state=42)
+    X_tr_qt   = qt.fit_transform(X_tr)
+    X_val_qt  = qt.transform(X_val)
+    X_test_qt = qt.transform(X_test)
+    # FT class_weight 基于原始不平衡比例，不依赖 SMOTE
+    pos_orig = int(y_tr.sum())
+    neg_orig = len(y_tr) - pos_orig
+    ft_class_weight = {0: 1.0, 1: float(neg_orig / max(pos_orig, 1))}
+
     pos_w = float((y_tr_sm == 0).sum() / max(y_tr_sm.sum(), 1))
     comparison: dict[str, dict] = {}
     trained_models: dict       = {}
 
-    ckpt_ft = cfg.artifacts_dir / "ckpt_fraud_ft.joblib"
-    ckpt_dt = cfg.artifacts_dir / "ckpt_fraud_dt.joblib"
-    ckpt_rf = cfg.artifacts_dir / "ckpt_fraud_rf.joblib"
+    ckpt_tabnet = cfg.artifacts_dir / "ckpt_fraud_tabnet.joblib"
+    ckpt_dt     = cfg.artifacts_dir / "ckpt_fraud_dt.joblib"
+    ckpt_rf     = cfg.artifacts_dir / "ckpt_fraud_rf.joblib"
 
-    # ---- FT-Transformer ----
-    ft_path = cfg.artifacts_dir / "fraud_ft_transformer.keras"
-    if ckpt_ft.exists():
-        ck = joblib.load(ckpt_ft)
-        comparison["ft_transformer"] = ck["metrics"]
-        trained_models["ft_transformer"] = str(ft_path)
-        print(f"\n[Fraud] FT-Transformer 已有检查点，跳过训练  "
+    # ---- TabNet ----
+    if ckpt_tabnet.exists():
+        ck = joblib.load(ckpt_tabnet)
+        comparison["tabnet"] = ck["metrics"]
+        trained_models["tabnet"] = ck["model"]
+        if "qt" in ck:
+            qt = ck["qt"]
+        print(f"\n[Fraud] TabNet 已有检查点，跳过训练  "
               f"Recall={ck['metrics']['recall']:.4f}  F1={ck['metrics']['f1']:.4f}")
     else:
-        print("\n[Fraud] 训练 FT-Transformer ...")
-        ft_model = _build_ft_transformer(n_features=len(feature_cols))
-        ft_model.compile(
-            optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-4, weight_decay=1e-5),
-            loss=tf.keras.losses.BinaryCrossentropy(),
-            metrics=["accuracy"],
-        )
-        ft_model.fit(
-            X_tr_sc, y_tr_sm,
-            validation_data=(X_val_sc, y_val.values),
-            epochs=50, batch_size=2048,
-            class_weight={0: 1.0, 1: float(pos_w)},
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="val_loss", patience=8, restore_best_weights=True),
-                tf.keras.callbacks.ReduceLROnPlateau(
-                    monitor="val_loss", factor=0.5, patience=4, min_lr=1e-7),
-            ],
-            verbose=0,
-        )
-        proba_ft_val  = ft_model.predict(X_val_sc,  batch_size=2048, verbose=0).ravel()
-        proba_ft_test = ft_model.predict(X_test_sc, batch_size=2048, verbose=0).ravel()
-        thr_ft = _find_best_threshold_recall(y_val.values, proba_ft_val)
-        m_ft = _eval_fraud(y_test.values, proba_ft_test, thr_ft, "FT-Transformer")
-        comparison["ft_transformer"] = m_ft
-        ft_model.save(str(ft_path))
-        trained_models["ft_transformer"] = str(ft_path)
-        joblib.dump({"metrics": m_ft}, ckpt_ft)
+        print("\n[Fraud] 训练 TabNet ...")
+        tabnet = _train_tabnet(X_tr_qt, y_tr.values, X_val_qt, y_val.values)
+        proba_tabnet_val  = tabnet.predict_proba(X_val_qt)[:, 1]
+        proba_tabnet_test = tabnet.predict_proba(X_test_qt)[:, 1]
+        thr_tabnet = _find_best_threshold_f1(y_val.values, proba_tabnet_val)
+        m_tabnet = _eval_fraud(y_test.values, proba_tabnet_test, thr_tabnet, "TabNet")
+        comparison["tabnet"] = m_tabnet
+        trained_models["tabnet"] = tabnet
+        joblib.dump({"metrics": m_tabnet, "qt": qt, "model": tabnet}, ckpt_tabnet)
 
     # ---- 决策树 ----
     if ckpt_dt.exists():
@@ -677,18 +686,23 @@ def train_fraud_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
               f"Recall={ck['metrics']['recall']:.4f}  F1={ck['metrics']['f1']:.4f}")
     else:
         print("\n[Fraud] 训练 决策树 ...")
-        dt = DecisionTreeClassifier(
-            max_depth=10,
-            min_samples_leaf=50,
-            min_samples_split=100,
+        dt_base = DecisionTreeClassifier(
+            max_depth=20,
+            min_samples_leaf=10,
+            min_samples_split=20,
             class_weight="balanced",
             criterion="gini",
             random_state=42,
         )
-        dt.fit(X_tr_sm, y_tr_sm)
+        dt_base.fit(X_tr_sm, y_tr_sm)
+        # Platt 校准：在真实 val 分布上校准概率，避免 SMOTE 引入的概率偏移
+        # sklearn 1.6+ 移除了 cv="prefit"，改用 FrozenEstimator 包装已训练模型
+        from sklearn.frozen import FrozenEstimator
+        dt = CalibratedClassifierCV(FrozenEstimator(dt_base), method="sigmoid")
+        dt.fit(X_val_sc, y_val.values)
         proba_dt_val  = dt.predict_proba(X_val_sc)[:, 1]
         proba_dt_test = dt.predict_proba(X_test_sc)[:, 1]
-        thr_dt = _find_best_threshold_recall(y_val.values, proba_dt_val)
+        thr_dt = _find_best_threshold_f1(y_val.values, proba_dt_val)
         m_dt = _eval_fraud(y_test.values, proba_dt_test, thr_dt, "决策树")
         comparison["decision_tree"] = m_dt
         trained_models["decision_tree"] = dt
@@ -741,9 +755,10 @@ def train_fraud_model(cfg: ProjectConfig, df: pd.DataFrame) -> dict:
         "comparison":    comparison,
         "comp_scores":   comp_scores,
     }
-    if winner == "ft_transformer":
-        artifact["model_path"] = str(ft_path)
-        artifact["model_type"] = "ft_transformer"
+    if winner == "tabnet":
+        artifact["scaler"]     = qt   # TabNet 用 QuantileTransformer，覆盖默认 StandardScaler
+        artifact["model"]      = trained_models["tabnet"]
+        artifact["model_type"] = "tabnet"
     elif winner == "decision_tree":
         artifact["model"] = dt
         artifact["model_type"] = "decision_tree"

@@ -394,8 +394,9 @@ async function refreshAll() {
   // 模型指标
   renderModelMetrics(modelMetrics);
 
-  // 系统指标
-  renderSystemMetrics(MockData.systemMetrics);
+  // 系统指标 - 改从后端实时获取
+  const systemMetrics = await API.statsSystemMetrics();
+  renderSystemMetrics(systemMetrics);
 
   // 最新决策
   renderRecentDecisions(recentDecisions);

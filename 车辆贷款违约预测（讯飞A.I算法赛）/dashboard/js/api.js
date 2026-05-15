@@ -47,6 +47,10 @@ const API = {
     return this.get('/stats/overview');
   },
 
+  async statsSystemMetrics() {
+    return this.get('/stats/system_metrics');
+  },
+
   async statsRiskDaily() {
     return this.get('/stats/risk_daily');
   },
