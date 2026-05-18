@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>数据导入 Pipeline - 贷款客户信息修复与智能决策系统</title>
+  <link rel="stylesheet" href="/dashboard/css/main.css" />
+  <style>
+    /* ========== 上传区域 ========== */
+    .upload-zone {
+      border: 2px dashed #b8c5d6;
+      border-radius: var(--radius-md);
+      padding: 32px 20px;
+      text-align: center;
+      background: #fafbfc;
+      transition: all 0.2s;
+      cursor: pointer;
+    }
+    .upload-zone:hover, .upload-zone.dragover {
+      border-color: var(--color-primary);
+      background: #f0f6ff;
+    }
+    .upload-zone .upload-icon {
+      font-size: 36px; color: var(--color-primary); margin-bottom: 8px;
+    }
+    .upload-zone .upload-tip {
+      font-size: 13px; color: var(--color-text); margin-bottom: 4px;
+    }
+    .upload-zone .upload-sub {
+      font-size: 11px; color: var(--color-text-muted);
+    }
+    .upload-zone input[type=file] { display: none; }
+    .upload-bar {
+      display: flex; gap: 10px; align-items: center; margin-top: 14px;
+    }
+    .upload-bar .file-name {
+      flex: 1; font-size: 13px; color: var(--color-text);
+      background: #fff; border: 1px solid #d0d4d8;
+      padding: 8px 12px; border-radius: 4px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .upload-bar .file-name.empty { color: #9aa0a6; }
+    .upload-bar button {
+      padding: 8px 18px; border: none; border-radius: 4px;
+      background: var(--color-primary); color: white;
+      font-weight: 600; cursor: pointer; font-size: 13px;
+    }
+    .upload-bar button:disabled {
+      background: #c0c4c8; cursor: not-allowed;
+    }
+    .upload-bar button.secondary {
+      background: #fff; color: var(--color-text); border: 1px solid #d0d4d8;
+    }
+
+    /* ========== Pipeline 时间线 ========== */
+    .pipeline-timeline {
+      position: relative;
+      padding-left: 38px;
+    }
+    .pipeline-timeline::before {
+      content: ""; position: absolute; left: 18px; top: 8px; bottom: 8px;
+      width: 2px; background: linear-gradient(180deg, #1a73e8, #e0e4e8);
+    }
+    .step-node {
+      position: relative; padding: 14px 16px;
+      background: #fff; border-radius: var(--radius-sm);
+      border-left: 3px solid #d0d4d8;
+      margin-bottom: 10px; box-shadow: var(--shadow-sm);
+      transition: all 0.3s;
+    }
+    .step-node.pending  { opacity: 0.6; }
+    .step-node.running  { border-left-color: #fbbc04; background: #fffbeb; box-shadow: 0 0 0 3px rgba(251,188,4,0.15); }
+    .step-node.completed { border-left-color: #34a853; }
+    .step-node.failed   { border-left-color: #ea4335; background: #fef0ee; }
+
+    .step-node .step-dot {
+      position: absolute; left: -28px; top: 16px;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: #fff; border: 2px solid #d0d4d8;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 700; color: #5f6368;
+    }
+    .step-node.running .step-dot {
+      border-color: #fbbc04; background: #fbbc04; color: white;
+      animation: pulse 1s ease-in-out infinite;
+    }
+    .step-node.completed .step-dot {
+      border-color: #34a853; background: #34a853; color: white;
+    }
+    .step-node.failed .step-dot {
+      border-color: #ea4335; background: #ea4335; color: white;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(251,188,4,0.5); }
+      50%      { transform: scale(1.15); box-shadow: 0 0 0 6px rgba(251,188,4,0); }
+    }
+
+    .step-node .step-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+      margin-bottom: 4px;
+    }
+    .step-node .step-name { font-weight: 600; font-size: 14px; }
+    .step-node .step-layer {
+      font-size: 11px; color: var(--color-text-muted);
+      font-family: monospace; background: #f0f0f0;
+      padding: 1px 6px; border-radius: 3px;
+    }
+    .step-node .step-msg {
+      font-size: 12px; color: var(--color-text); margin-top: 4px;
+    }
+    .step-node .step-extra {
+      margin-top: 8px; padding-top: 8px;
+      border-top: 1px dashed #e8e8e8;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
+      font-size: 11px;
+    }
+    .step-node .step-extra .ek { color: var(--color-text-muted); }
+    .step-node .step-extra .ev { font-family: monospace; color: var(--color-primary); font-weight: 600; }
+    .step-node .step-time {
+      font-size: 10px; color: #9aa0a6; margin-top: 4px;
+    }
+
+    /* ========== 顶部进度 ========== */
+    .job-banner {
+      display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px;
+      margin-bottom: 16px;
+    }
+    .banner-card {
+      background: var(--color-card); border-radius: var(--radius-md);
+      padding: 12px 16px; box-shadow: var(--shadow-sm);
+    }
+    .banner-card .bc-label { font-size: 11px; color: var(--color-text-muted); }
+    .banner-card .bc-value { font-size: 1.4rem; font-weight: 700; margin-top: 4px; }
+    .banner-card.success .bc-value { color: #34a853; }
+    .banner-card.warn    .bc-value { color: #fbbc04; }
+    .banner-card.danger  .bc-value { color: #ea4335; }
+
+    /* ========== 结果表格 ========== */
+    .result-table {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+    }
+    .result-table th, .result-table td {
+      padding: 6px 10px; text-align: left; border-bottom: 1px solid #f0f0f0;
+    }
+    .result-table th {
+      background: #fafbfc; color: var(--color-text-muted);
+      font-weight: 500; font-size: 11px;
+    }
+    .result-table .score    { font-family: monospace; color: var(--color-primary); font-weight: 600; }
+    .result-table .tag-red  { color: #ea4335; font-weight: 600; background:#fce8e6; padding:2px 8px; border-radius:10px; font-size:11px; }
+    .result-table .tag-yel  { color: #b06000; font-weight: 600; background:#fef7e0; padding:2px 8px; border-radius:10px; font-size:11px; }
+    .result-table .tag-grn  { color: #1e8e3e; font-weight: 600; background:#e6f4ea; padding:2px 8px; border-radius:10px; font-size:11px; }
+
+    /* ========== 历史任务列表 ========== */
+    .history-row {
+      display: flex; gap: 10px; padding: 8px 12px;
+      border-bottom: 1px solid #f0f0f0; font-size: 12px;
+      cursor: pointer;
+    }
+    .history-row:hover { background: #fafbfc; }
+    .history-row .h-id { font-family: monospace; color: var(--color-primary); min-width: 100px; }
+    .history-row .h-file { flex: 1; color: var(--color-text); }
+    .history-row .h-rows { color: var(--color-text-muted); min-width: 60px; text-align: right; }
+    .history-row .h-status { min-width: 60px; }
+    .h-status.completed { color: #34a853; }
+    .h-status.running   { color: #fbbc04; }
+    .h-status.failed    { color: #ea4335; }
+    .h-status.pending   { color: #9aa0a6; }
+
+    /* ========== Layout ========== */
+    .import-layout {
+      display: grid; grid-template-columns: 1fr 2fr; gap: 16px;
+    }
+    @media (max-width: 1100px) {
+      .import-layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="logo">
+        <div class="logo-icon">&#x1F3E6;</div>
+        <span>贷款客户信息修复与智能决策系统</span>
+      </div>
+      <nav class="header-nav">
+        <a href="/dashboard/index.html" class="nav-link">综合看板</a>
+        <a href="/dashboard/customer_profile.html" class="nav-link">客户画像</a>
+        <a href="/dashboard/risk_heatmap.html" class="nav-link">风险热力图</a>
+        <a href="/dashboard/model_explain.html" class="nav-link">模型解释</a>
+        <a href="/dashboard/data_repair.html" class="nav-link">数据修复</a>
+        <a href="/dashboard/data_import.html" class="nav-link active">数据导入</a>
+      </nav>
+    </header>
+
+    <main class="main-content">
+      <div class="page-title" style="margin-bottom:16px;">
+        <div class="title-left">
+          <div class="title-icon">&#x1F4E5;</div>
+          <div>
+            <h1 style="font-size:1.4rem;margin:0;">数据导入 Pipeline</h1>
+            <div class="last-update">
+              Excel/CSV → MySQL → Flume → HDFS → 清洗 → 修复 → 特征 → 推理 → 落库
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 顶部 4 卡：任务摘要 -->
+      <div class="job-banner" id="jobBanner">
+        <div class="banner-card"><div class="bc-label">任务 ID</div><div class="bc-value" id="bJobId">--</div></div>
+        <div class="banner-card"><div class="bc-label">导入行数</div><div class="bc-value" id="bRows">--</div></div>
+        <div class="banner-card"><div class="bc-label">当前步骤</div><div class="bc-value" id="bStep" style="font-size:1.1rem;">未启动</div></div>
+        <div class="banner-card"><div class="bc-label">状态</div><div class="bc-value" id="bStatus" style="font-size:1.1rem;">等待上传</div></div>
+      </div>
+
+      <div class="import-layout">
+        <!-- 左：上传 + 历史任务 -->
+        <div style="display:flex;flex-direction:column;gap:16px;">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <span class="card-title-icon" style="background:#e8f0fe;color:#1a73e8;">&#x1F4E4;</span>
+                上传新用户数据
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+                <div class="upload-icon">&#x2601;&#xFE0F;</div>
+                <div class="upload-tip">点击选择文件 或 拖拽到此处</div>
+                <div class="upload-sub">支持 .xlsx / .xls / .csv，需包含 customer_id 列</div>
+                <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+              </div>
+              <div class="upload-bar">
+                <div class="file-name empty" id="fileName">尚未选择文件</div>
+                <button class="secondary" onclick="downloadTemplate()">下载模板</button>
+                <button id="btnUpload" disabled onclick="startUpload()">开始导入</button>
+              </div>
+              <div style="margin-top:10px;font-size:11px;color:var(--color-text-muted);line-height:1.6;">
+                <strong>演示数据流：</strong>上传后系统将依次执行 8 步处理，每步实时显示进度。
+                你可以下载模板查看示例字段，模板已预置 1 条缺失 <code>Credit_level</code> 的记录用于演示数据修复。
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <span class="card-title-icon" style="background:#fef7e0;color:#f9ab00;">&#x1F4DC;</span>
+                历史导入任务
+              </div>
+            </div>
+            <div class="card-body" id="historyList" style="padding:0;">
+              <div style="padding:16px;text-align:center;color:var(--color-text-muted);font-size:12px;">
+                暂无历史任务
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右：Pipeline 时间线 + 结果 -->
+        <div style="display:flex;flex-direction:column;gap:16px;">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">
+                <span class="card-title-icon" style="background:#e6f4ea;color:#34a853;">&#x1F501;</span>
+                Pipeline 实时进度
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="pipeline-timeline" id="pipelineTimeline">
+                <!-- JS 注入步骤 -->
+              </div>
+            </div>
+          </div>
+
+          <div class="card" id="resultCard" style="display:none;">
+            <div class="card-header">
+              <div class="card-title">
+                <span class="card-title-icon" style="background:#fce8e6;color:#ea4335;">&#x1F4CA;</span>
+                决策结果
+              </div>
+            </div>
+            <div class="card-body" id="resultBox">
+              <!-- JS 注入 -->
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/dashboard/js/api.js"></script>
+  <script src="/dashboard/js/data_import.js"></script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+customer_id,age,employment_type,area_id,credit_score,credit_history,disbursed_amount,asset_cost,ltv_ratio,total_overdue_no,total_outstanding_loan,total_monthly_payment,total_account_loan_no,total_disbursed_loan,main_account_loan_no,main_account_active_loan_no,main_account_overdue_no,main_account_monthly_payment,sub_account_loan_no,last_six_month_new_loan_no,last_six_month_defaulted_no,enquirie_no,Credit_level
+999001,35,1,3,680.0,8,50000,100000,0.5,0,25000,1500,2,50000,1,1,0,1500,0,1,0,2,3
+999002,42,2,5,,12,80000,160000,0.5,1,45000,2200,3,80000,2,2,1,2200,1,0,0,1,-1
