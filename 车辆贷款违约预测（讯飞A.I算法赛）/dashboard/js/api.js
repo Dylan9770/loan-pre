@@ -149,6 +149,18 @@ const API = {
   async repairEvaluation() {
     return this.get('/repair/evaluation');
   },
+
+  async repairByCustomer(customerId) {
+    try {
+      const response = await fetch(`/repair/by_customer/${customerId}`);
+      if (response.status === 404) return { __not_found: true, customer_id: customerId };
+      if (!response.ok) return null;
+      return await response.json();
+    } catch (e) {
+      console.error(`[API] GET /repair/by_customer/${customerId} failed:`, e);
+      return null;
+    }
+  },
 };
 
 /* ---------- 数据模拟（无后端时提供示例数据） ---------- */

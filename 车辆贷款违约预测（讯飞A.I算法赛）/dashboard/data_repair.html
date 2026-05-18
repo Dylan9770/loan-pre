@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>数据修复 - 贷款客户信息修复与智能决策系统</title>
+  <script src="/dashboard/assets/echarts.min.js"></script>
+  <link rel="stylesheet" href="/dashboard/css/main.css" />
+  <style>
+    .repair-grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+
+    .stat-card-mini {
+      background: var(--color-card); border-radius: var(--radius-md);
+      padding: 16px; box-shadow: var(--shadow-sm);
+      display:flex; flex-direction:column; gap:6px;
+    }
+    .stat-card-mini .stat-label { font-size:12px; color:var(--color-text-muted); }
+    .stat-card-mini .stat-value { font-size:1.8rem; font-weight:700; }
+    .stat-card-mini .stat-extra { font-size:11px; color:var(--color-text-muted); }
+
+    .method-card { padding:14px; background:#fafbfc; border-radius:var(--radius-sm); margin-bottom:12px; }
+    .method-card .mc-title {
+      font-weight:600; font-size:14px; margin-bottom:10px;
+      display:flex; justify-content:space-between; align-items:center;
+    }
+    .method-card .mc-row {
+      display:flex; justify-content:space-between; padding:6px 0;
+      border-bottom:1px dashed #e0e4e8; font-size:12px;
+    }
+    .method-card .mc-row:last-child { border-bottom:none; }
+    .method-card .mc-key { color:var(--color-text-muted); }
+    .method-card .mc-val { font-weight:600; }
+
+    .repair-form {
+      display:grid; grid-template-columns:repeat(2, 1fr); gap:10px; margin-bottom:14px;
+    }
+    .repair-form .form-row { display:flex; flex-direction:column; gap:4px; }
+    .repair-form label { font-size:11px; color:var(--color-text-muted); }
+    .repair-form input {
+      padding:6px 10px; border:1px solid #d0d4d8; border-radius:4px;
+      font-size:13px; background:#fff;
+    }
+    .repair-form input:focus { outline:none; border-color:var(--color-primary); }
+
+    .form-actions { grid-column:1/-1; display:flex; gap:8px; align-items:center; }
+    .form-actions button {
+      padding:8px 16px; border:none; border-radius:4px;
+      background:var(--color-primary); color:white; font-weight:600; cursor:pointer; font-size:13px;
+    }
+    .form-actions button:hover { opacity:0.9; }
+    .form-actions button.secondary { background:#fff; color:var(--color-text); border:1px solid #d0d4d8; }
+    .form-actions .form-tip { font-size:11px; color:var(--color-text-muted); margin-left:auto; }
+
+    .repair-result { margin-top:16px; }
+    .repair-row {
+      display:flex; align-items:center; gap:12px;
+      padding:10px 12px; background:#fafbfc; border-left:3px solid #34a853;
+      border-radius:4px; margin-bottom:6px; font-size:12px;
+    }
+    .repair-row.empty { border-left-color:#9aa0a6; opacity:0.7; }
+    .repair-row .rr-field { font-weight:600; min-width:130px; }
+    .repair-row .rr-method { color:var(--color-text-muted); flex:1; font-size:11px; }
+    .repair-row .rr-value { font-weight:700; color:var(--color-primary); min-width:80px; text-align:right; }
+    .repair-row .rr-conf { font-size:10px; color:var(--color-text-muted); min-width:80px; text-align:right; }
+
+    .field-spec li { padding:4px 0; font-size:12px; color:var(--color-text-muted); list-style:none; }
+    .known-fields-table {
+      width:100%; border-collapse:collapse; font-size:12px; margin-bottom:12px;
+    }
+    .known-fields-table th, .known-fields-table td {
+      padding:6px 10px; text-align:left; border-bottom:1px solid #f0f0f0;
+    }
+    .known-fields-table th { color:var(--color-text-muted); font-weight:500; font-size:11px; background:#fafbfc; }
+    .known-fields-table .kv { font-family:monospace; color:var(--color-primary); font-weight:600; }
+
+    .field-spec li code {
+      background:#f5f7fa; padding:1px 6px; border-radius:3px;
+      font-family:monospace; color:var(--color-primary); font-size:11px;
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="logo">
+        <div class="logo-icon">&#x1F3E6;</div>
+        <span>贷款客户信息修复与智能决策系统</span>
+      </div>
+      <nav class="header-nav">
+        <a href="/dashboard/index.html" class="nav-link">综合看板</a>
+        <a href="/dashboard/customer_profile.html" class="nav-link">客户画像</a>
+        <a href="/dashboard/risk_heatmap.html" class="nav-link">风险热力图</a>
+        <a href="/dashboard/model_explain.html" class="nav-link">模型解释</a>
+        <a href="/dashboard/data_repair.html" class="nav-link active">数据修复</a>
+      </nav>
+    </header>
+
+    <main class="main-content">
+      <div class="page-title" style="margin-bottom:16px;">
+        <div class="title-left">
+          <div class="title-icon">&#x1F527;</div>
+          <div>
+            <h1 style="font-size:1.4rem;margin:0;">数据修复中心</h1>
+            <div class="last-update">关联规则填补 (FP-Growth) &nbsp;·&nbsp; 数值字段自适应填补 (ALS-style)</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 顶部 4 张统计卡 -->
+      <div class="dashboard-grid" style="grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:16px;" id="topStats">
+        <div class="stat-card-mini"><div class="stat-label">字段覆盖率</div><div class="stat-value" id="statCoverage">--</div><div class="stat-extra">FP-Growth 修复字段命中率</div></div>
+        <div class="stat-card-mini"><div class="stat-label">关联规则数</div><div class="stat-value" id="statRules">--</div><div class="stat-extra">从训练集挖掘的频繁项集</div></div>
+        <div class="stat-card-mini"><div class="stat-label">平均规则置信度</div><div class="stat-value" id="statConf">--</div><div class="stat-extra">命中规则的平均 confidence</div></div>
+        <div class="stat-card-mini"><div class="stat-label">数值列覆盖率</div><div class="stat-value" id="statNumCov">--</div><div class="stat-extra">ALS-style 可填补占比</div></div>
+      </div>
+
+      <div class="repair-grid">
+        <!-- 左：两种方法的指标对比 -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-title-icon" style="background:#e8f0fe;color:#1a73e8;">&#x1F4CA;</span>
+              修复方法评估报告
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="method-card">
+              <div class="mc-title">
+                FP-Growth 关联规则修复
+                <span class="badge badge-info">分类字段</span>
+              </div>
+              <div class="mc-row"><span class="mc-key">目标字段</span><span class="mc-val">Credit_level</span></div>
+              <div class="mc-row"><span class="mc-key">上下文字段</span><span class="mc-val">employment_type / area_id / age / credit_history</span></div>
+              <div class="mc-row"><span class="mc-key">字段覆盖率</span><span class="mc-val" id="fpCoverage">--</span></div>
+              <div class="mc-row"><span class="mc-key">命中准确率</span><span class="mc-val" id="fpAcc">--</span></div>
+              <div class="mc-row"><span class="mc-key">平均置信度</span><span class="mc-val" id="fpConf">--</span></div>
+              <div class="mc-row"><span class="mc-key">规则数量</span><span class="mc-val" id="fpRules">--</span></div>
+            </div>
+            <div class="method-card">
+              <div class="mc-title">
+                自适应数值填补 (ALS-style)
+                <span class="badge badge-warning">数值字段</span>
+              </div>
+              <div class="mc-row"><span class="mc-key">目标字段</span><span class="mc-val" style="font-size:11px;">credit_score / disbursed_amount / asset_cost / total_outstanding_loan / total_monthly_payment</span></div>
+              <div class="mc-row"><span class="mc-key">RMSE</span><span class="mc-val" id="alsRmse">--</span></div>
+              <div class="mc-row"><span class="mc-key">MAPE</span><span class="mc-val" id="alsMape">--</span></div>
+              <div class="mc-row"><span class="mc-key">字段覆盖率</span><span class="mc-val" id="alsCoverage">--</span></div>
+            </div>
+
+            <div class="section-label" style="margin-top:14px;">&#x1F4D6; 修复策略说明</div>
+            <ul class="field-spec">
+              <li>对 <code>Credit_level</code> 缺失或 <code>-1</code> 的记录，查询训练集挖出的关联规则（最高置信度匹配）。</li>
+              <li>对数值字段缺失，按列分布选 mean 或 median 填补；极端列优先 median。</li>
+              <li>修复结果一并写回 <code>data_lake/featured/train_repaired.csv</code>，供下游模型训练使用。</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- 右：单条记录修复试用 -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="card-title-icon" style="background:#fef7e0;color:#f9ab00;">&#x1F9EA;</span>
+              单条记录修复试用
+            </div>
+          </div>
+          <div class="card-body">
+            <div style="font-size:12px;color:var(--color-text-muted);margin-bottom:10px;line-height:1.6;">
+              输入客户 ID，系统从数据库自动拉取所有特征，识别缺失字段后用 <code style="background:#f0f0f0;padding:1px 4px;border-radius:3px;">FP-Growth</code> + <code style="background:#f0f0f0;padding:1px 4px;border-radius:3px;">中位数</code> 算法补全。
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:14px;">
+              <input id="f_customer_id" placeholder="客户 ID（如 100023）" style="flex:1;padding:8px 12px;border:1px solid #d0d4d8;border-radius:4px;font-size:13px;" />
+              <button onclick="onPickRandom()" class="btn-secondary" style="padding:8px 14px;border:1px solid #d0d4d8;background:#fff;border-radius:4px;font-size:13px;cursor:pointer;">随机选一个</button>
+              <button onclick="onRepairSubmit()" style="padding:8px 16px;border:none;background:var(--color-primary);color:white;font-weight:600;border-radius:4px;cursor:pointer;font-size:13px;">查询并修复</button>
+            </div>
+
+            <div class="repair-result">
+              <div id="repairResultBox">
+                <div style="font-size:12px;color:var(--color-text-muted);text-align:center;padding:20px;">
+                  请输入客户 ID，或点「随机选一个」
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/dashboard/js/api.js"></script>
+  <script src="/dashboard/js/data_repair.js"></script>
+</body>
+</html>
