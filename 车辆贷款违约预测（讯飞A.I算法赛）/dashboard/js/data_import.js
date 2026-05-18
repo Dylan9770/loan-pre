@@ -198,7 +198,6 @@ function renderResults(result) {
       <td class="score">${r.credit_score}</td>
       <td class="score">${(r.default_probability * 100).toFixed(2)}%</td>
       <td>${r.default_pred ? '<span class="tag-red">违约</span>' : '<span class="tag-grn">正常</span>'}</td>
-      <td class="score">${(r.fraud_probability * 100).toFixed(2)}%</td>
       <td>${r.fraud_pred ? '<span class="tag-red">疑似</span>' : '<span class="tag-grn">正常</span>'}</td>
       <td class="score">${Number(r.predicted_limit).toLocaleString()}</td>
     </tr>
@@ -208,7 +207,7 @@ function renderResults(result) {
     <table class="result-table">
       <thead><tr>
         <th>客户ID</th><th>信用分</th><th>违约概率</th><th>违约判定</th>
-        <th>欺诈概率</th><th>欺诈判定</th><th>建议额度(元)</th>
+        <th>欺诈判定</th><th>建议额度(元)</th>
       </tr></thead>
       <tbody>${tableRows}</tbody>
     </table>

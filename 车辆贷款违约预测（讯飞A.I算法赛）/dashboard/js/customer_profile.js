@@ -48,16 +48,29 @@ const MockSimilarCustomers = [
   { customer_id: 100007, credit_score: 748, disbursed_amount: 47000, total_overdue_no: 0, actual_performance: '正常还款', similarity: 0.87 },
 ];
 
-const MockLoanTimeline = [
-  { date: '2024-01-15', type: 'loan-apply', title: '提交贷款申请', detail: '申请金额: 45000元, 用途: 购车' },
-  { date: '2024-01-18', type: 'loan-disbursed', title: '贷款发放', detail: '实际发放: 45000元, 利率: 6.5%, 期限: 36期' },
-  { date: '2024-02-15', type: 'ontime-repay', title: '按时还款', detail: '本期还款: 1380元, 余额: 43470元' },
-  { date: '2024-03-15', type: 'ontime-repay', title: '按时还款', detail: '本期还款: 1380元, 余额: 42000元' },
-  { date: '2024-04-15', type: 'ontime-repay', title: '按时还款', detail: '本期还款: 1380元, 余额: 40530元' },
-  { date: '2024-05-15', type: 'overdue', title: '逾期还款', detail: '逾期5天, 罚款: 68元, 已补缴' },
-  { date: '2024-06-15', type: 'ontime-repay', title: '按时还款', detail: '本期还款: 1380元, 余额: 37890元' },
-  { date: '2024-07-15', type: 'closed', title: '贷款结清', detail: '提前还清全部本金, 结清证明已生成' },
-];
+const MockCreditProfile = {
+  recent_activity: [
+    { label: '近6月新增贷款', value: 1, unit: '笔', tone: 'ok' },
+    { label: '近6月违约',     value: 0, unit: '次', tone: 'ok' },
+    { label: '征信查询次数', value: 3, unit: '次', tone: 'warn' },
+    { label: '信用历史',     value: 4, unit: '年', tone: 'ok' },
+  ],
+  finance_health: {
+    asset_cost:      { label: '资产成本（车价）', value: 75000, unit: '元', max: 200000,
+                       bands: { ok: [0, 80000], warn: [80000, 150000], danger: [150000, 200000] } },
+    monthly_payment: { label: '月供负担', value: 5800, unit: '元', max: 50000,
+                       bands: { ok: [0, 15000], warn: [15000, 30000], danger: [30000, 50000] } },
+    ltv:             { label: '杠杆率(LTV)', value: 0.71, unit: '', max: 1.2,
+                       bands: { ok: [0.5, 0.75], warn_low: [0.3, 0.5], warn_high: [0.75, 1.0],
+                                danger_low: [0, 0.3], danger_high: [1.0, 1.2] } },
+  },
+  peer_percentile: [
+    { label: '信用评分',  value: 720, percentile: 78 },
+    { label: '逾期次数',  value: 0,   percentile: 92 },
+    { label: '月供负担',  value: 1380, percentile: 55 },
+    { label: '杠杆率(LTV)', value: 0.71, percentile: 48 },
+  ],
+};
 
 /* ---------- 雷达图渲染 ---------- */
 function renderRadarChart(profile) {
@@ -136,6 +149,9 @@ function renderDecisionResult(profile) {
   const fraudProb = profile.fraud_probability != null
     ? Number(profile.fraud_probability)
     : (profile.loan_default === 1 ? 0.15 : 0.03);
+  const fraudPred = profile.fraud_pred != null
+    ? Number(profile.fraud_pred)
+    : (fraudProb >= 0.5 ? 1 : 0);
   const creditScore = Math.round(Number(profile.credit_score) || 650);
   const predictedLimit = profile.predicted_limit != null
     ? Number(profile.predicted_limit)
@@ -151,7 +167,7 @@ function renderDecisionResult(profile) {
     { label: '违约概率', value: (defaultProb * 100).toFixed(1) + '%', cls: defaultProb > 0.5 ? 'text-danger' : defaultProb > 0.3 ? 'text-warning' : 'text-success', bg: defaultProb > 0.5 ? '#fce8e6' : '#e6f4ea' },
     { label: '信用评分', value: creditScore, cls: creditScore >= 700 ? 'text-success' : creditScore >= 550 ? 'text-warning' : 'text-danger', bg: '#e8f0fe' },
     { label: '预测额度', value: fmtAmount(predictedLimit), cls: '', bg: '#e6f4ea' },
-    { label: '欺诈概率', value: (fraudProb * 100).toFixed(1) + '%', cls: fraudProb > 0.5 ? 'text-danger' : fraudProb > 0.1 ? 'text-warning' : 'text-success', bg: '#fef7e0' },
+    { label: '欺诈判定', value: fraudPred ? '疑似' : '正常', cls: fraudPred ? 'text-danger' : 'text-success', bg: fraudPred ? '#fce8e6' : '#e6f4ea' },
   ];
 
   el.dataset.source = hasReal ? 'model' : 'fallback';
@@ -243,31 +259,131 @@ function renderSimilarCustomers(profile, similar) {
   tbody.innerHTML = targetRow + similarRows;
 }
 
-/* ---------- 贷款时间轴渲染 ---------- */
-function renderTimeline(timeline) {
-  const el = document.getElementById('timelineContainer');
-  if (!el) return;
+/* ---------- 客户信贷画像渲染（B + C + D） ---------- */
+function renderActivityCards(items) {
+  const el = document.getElementById('activityCards');
+  if (!el || !items) return;
+  el.innerHTML = items.map(it => `
+    <div class="activity-card ${it.tone || ''}">
+      <div class="ac-value">${it.value}<span class="ac-unit">${it.unit || ''}</span></div>
+      <div class="ac-label">${it.label}</div>
+    </div>
+  `).join('');
+}
 
-  const events = timeline || MockLoanTimeline;
-  const typeClass = {
-    'loan-apply': 'loan-apply',
-    'loan-disbursed': 'loan-disbursed',
-    'ontime-repay': 'ontime-repay',
-    'overdue': 'overdue',
-    'default': 'default',
-    'closed': 'closed',
+/**
+ * Build ECharts gauge option with multi-color segments derived from band ranges.
+ * `bands` 里每个 key 形如 ok/warn/warn_low/warn_high/danger/danger_low/danger_high
+ * 每段值为 [start, end]，颜色按 key 前缀映射。
+ */
+function _gaugeOption(spec) {
+  const max = Number(spec.max) || 1;
+  const value = Math.max(0, Math.min(max, Number(spec.value) || 0));
+
+  const colorMap = {
+    ok: CHART_COLORS.success,
+    warn: CHART_COLORS.warning,
+    warn_low: CHART_COLORS.warning,
+    warn_high: CHART_COLORS.warning,
+    danger: CHART_COLORS.danger,
+    danger_low: CHART_COLORS.danger,
+    danger_high: CHART_COLORS.danger,
   };
 
-  let html = '<div class="timeline-line"></div>';
-  events.forEach(e => {
-    const tc = typeClass[e.type] || 'loan-apply';
-    html += `<div class="timeline-event ${tc}">
-      <div class="te-date">${e.date}</div>
-      <div class="te-title">${e.title}</div>
-      <div class="te-detail">${e.detail}</div>
-    </div>`;
+  // 把 bands 拍平成按 end 升序的色段列表
+  const segments = Object.entries(spec.bands || {})
+    .map(([k, [s, e]]) => ({ start: s, end: e, color: colorMap[k] || '#9aa0a6' }))
+    .sort((a, b) => a.start - b.start);
+
+  // ECharts gauge axisLine.color 需要 [[fraction, color], ...]
+  const axisColors = segments.map(seg => [seg.end / max, seg.color]);
+  if (axisColors.length === 0) axisColors.push([1, CHART_COLORS.primary]);
+
+  // 当前 value 落在哪个色段，用作指针/数字配色
+  const currentSeg = segments.find(s => value >= s.start && value <= s.end) || segments[segments.length - 1];
+  const valueColor = currentSeg ? currentSeg.color : CHART_COLORS.primary;
+
+  // 数字显示：金额带千分位，杠杆率两位小数
+  const fmtValue = (v) => {
+    if ((spec.unit || '') === '元') return Math.round(v).toLocaleString('zh-CN');
+    if (max <= 2) return v.toFixed(2);
+    return Math.round(v).toString();
+  };
+
+  return {
+    series: [{
+      type: 'gauge',
+      min: 0, max,
+      startAngle: 210, endAngle: -30,
+      radius: '92%',
+      center: ['50%', '62%'],
+      progress: { show: false },
+      axisLine: { lineStyle: { width: 8, color: axisColors } },
+      pointer: { length: '60%', width: 4, itemStyle: { color: valueColor } },
+      axisTick: { show: false },
+      splitLine: { show: false },
+      axisLabel: { show: false },
+      anchor: { show: true, size: 8, itemStyle: { color: valueColor } },
+      title: { show: false },
+      detail: {
+        valueAnimation: true,
+        offsetCenter: [0, '30%'],
+        fontSize: 14,
+        fontWeight: 700,
+        color: valueColor,
+        formatter: (v) => fmtValue(v),
+      },
+      data: [{ value }],
+    }],
+  };
+}
+
+function renderHealthRings(health) {
+  const el = document.getElementById('healthRings');
+  if (!el || !health) return;
+
+  const items = [
+    { id: 'gaugeAsset',   spec: health.asset_cost },
+    { id: 'gaugeMonthly', spec: health.monthly_payment },
+    { id: 'gaugeLtv',     spec: health.ltv },
+  ];
+
+  el.innerHTML = items.map(it => `
+    <div class="health-ring">
+      <div class="hr-chart" id="${it.id}"></div>
+      <div class="hr-label">${it.spec?.label || ''}</div>
+    </div>
+  `).join('');
+
+  items.forEach(it => {
+    if (!it.spec) return;
+    echarts.init(document.getElementById(it.id)).setOption(_gaugeOption(it.spec));
   });
-  el.innerHTML = html;
+}
+
+function renderPeerBars(items) {
+  const el = document.getElementById('peerBars');
+  if (!el || !items) return;
+  el.innerHTML = items.map(it => {
+    const pct = it.percentile;
+    const width = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+    const weak = pct != null && pct < 50;
+    const text = pct == null ? '— —' : `超过 ${pct}%`;
+    return `
+      <div class="peer-bar ${weak ? 'weak' : ''}">
+        <div class="pb-label">${it.label}</div>
+        <div class="pb-track"><div class="pb-fill" style="width:${width}%;"></div></div>
+        <div class="pb-value">${text}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderCreditProfile(data) {
+  const payload = data || MockCreditProfile;
+  renderActivityCards(payload.recent_activity);
+  renderHealthRings(payload.finance_health);
+  renderPeerBars(payload.peer_percentile);
 }
 
 /* ---------- 客户基本信息渲染 ---------- */
@@ -321,9 +437,9 @@ async function searchCustomer() {
     return;
   }
 
-  const [similar, timeline] = await Promise.all([
+  const [similar, creditProfile] = await Promise.all([
     API.customerSimilar(id).catch(() => null),
-    API.customerLoanHistory(id).catch(() => null),
+    API.customerCreditProfile(id).catch(() => null),
   ]);
 
   // API 返回嵌套结构 { customer_id, profile:{...}, decision:{...}, radar_scores:{...} }
@@ -353,9 +469,6 @@ async function searchCustomer() {
     };
   }
 
-  // 时间轴：API 返回 { events:[...] }，渲染函数需要数组
-  const timelineEvents = (timeline && timeline.events) ? timeline.events : (timeline || MockLoanTimeline);
-
   // 显示内容
   document.getElementById('profileContent').style.display = 'block';
   document.getElementById('noProfileState').style.display = 'none';
@@ -365,7 +478,7 @@ async function searchCustomer() {
   renderDecisionResult(flatProfile);
   renderShapForce(flatProfile);
   renderSimilarCustomers(flatProfile, similar);
-  renderTimeline(timelineEvents);
+  renderCreditProfile(creditProfile);
 
   // 调整图表大小
   setTimeout(() => {

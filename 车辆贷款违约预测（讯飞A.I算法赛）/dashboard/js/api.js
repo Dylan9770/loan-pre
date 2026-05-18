@@ -120,8 +120,8 @@ const API = {
     return this.get(`/customer/${customerId}/similar`);
   },
 
-  async customerLoanHistory(customerId) {
-    return this.get(`/customer/${customerId}/loan_history`);
+  async customerCreditProfile(customerId) {
+    return this.get(`/customer/${customerId}/credit_profile`);
   },
 
   /* ---------- 模型解释 ---------- */
@@ -131,6 +131,10 @@ const API = {
 
   async modelShapWaterfallSamples() {
     return this.get('/model/shap_waterfall_samples');
+  },
+
+  async modelExplainCustomer(customerId) {
+    return this.get(`/model/explain/${customerId}`);
   },
 
   async modelComparison() {

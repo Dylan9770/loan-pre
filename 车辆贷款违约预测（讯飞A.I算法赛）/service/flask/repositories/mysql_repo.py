@@ -1,8 +1,80 @@
 from __future__ import annotations
 
+import bisect
+import threading
+
 import pymysql
 
 from service.flask.config import Settings
+
+
+_PEER_METRICS = (
+    "credit_score",
+    "total_overdue_no",
+    "total_monthly_payment",
+    "loan_to_asset_ratio",
+)
+_peer_cache: dict[str, list[float]] = {}
+_peer_cache_lock = threading.Lock()
+
+
+def load_peer_distributions() -> dict[str, list[float]]:
+    """Load sorted distributions of key metrics from customer_features, lazy + cached.
+
+    Returns a dict {metric_name: sorted_list_of_values}. Used by compute_peer_percentile.
+    """
+    if _peer_cache:
+        return _peer_cache
+    with _peer_cache_lock:
+        if _peer_cache:  # double-check after acquiring lock
+            return _peer_cache
+        try:
+            conn = _connect(Settings.MYSQL_DB_ODS)
+        except Exception:
+            return _peer_cache
+        try:
+            with conn.cursor() as cur:
+                cols = ", ".join(_PEER_METRICS)
+                cur.execute(
+                    f"SELECT {cols} FROM customer_features "
+                    f"WHERE credit_score IS NOT NULL"
+                )
+                rows = cur.fetchall() or []
+            buckets: dict[str, list[float]] = {m: [] for m in _PEER_METRICS}
+            for r in rows:
+                for m in _PEER_METRICS:
+                    v = r.get(m)
+                    if v is None:
+                        continue
+                    try:
+                        buckets[m].append(float(v))
+                    except (TypeError, ValueError):
+                        continue
+            for m in _PEER_METRICS:
+                buckets[m].sort()
+                _peer_cache[m] = buckets[m]
+            return _peer_cache
+        except Exception:
+            return _peer_cache
+        finally:
+            conn.close()
+
+
+def compute_peer_percentile(value: float, metric: str) -> float | None:
+    """Return percentile (0-100) of `value` against the cached distribution.
+
+    Higher percentile = `value` is greater than that fraction of peers.
+    Returns None if the metric is unknown or the distribution is empty.
+    """
+    dist = load_peer_distributions().get(metric)
+    if not dist:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    idx = bisect.bisect_right(dist, v)
+    return round(100.0 * idx / len(dist), 1)
 
 
 def _connect(db_name: str):
@@ -149,12 +221,45 @@ def fetch_customer_loan_facts(customer_id: int) -> dict | None:
             cur.execute(
                 """
                 SELECT customer_id, disbursed_date, disbursed_amount, asset_cost,
-                       ltv_ratio, total_disbursed_loan, total_monthly_payment,
-                       total_overdue_no, total_outstanding_loan, loan_default,
-                       area_id
+                       ltv_ratio, total_disbursed_loan, total_sanction_loan,
+                       total_monthly_payment, total_overdue_no, total_outstanding_loan,
+                       outstanding_disburse_ratio, loan_default, area_id
                 FROM loan_fact
                 WHERE customer_id = %s
                 ORDER BY disbursed_date DESC
+                LIMIT 1
+                """,
+                (customer_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def fetch_customer_credit_signals(customer_id: int) -> dict | None:
+    """Fetch raw credit-activity columns from customer_features (CSV-mirrored)."""
+    try:
+        conn = _connect(Settings.MYSQL_DB_ODS)
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT customer_id,
+                       last_six_month_new_loan_no, last_six_month_defaulted_no,
+                       enquirie_no, credit_history,
+                       credit_score, total_overdue_no,
+                       total_monthly_payment, total_disbursed_loan,
+                       total_sanction_loan, total_outstanding_loan,
+                       total_account_loan_no, total_inactive_loan_no,
+                       outstanding_disburse_ratio, loan_to_asset_ratio,
+                       asset_cost, disbursed_amount
+                FROM customer_features
+                WHERE customer_id = %s
                 LIMIT 1
                 """,
                 (customer_id,),
@@ -236,7 +341,19 @@ def fetch_customer_profile(customer_id: int) -> dict | None:
 
 
 def fetch_customer_similar(customer_id: int, k: int = 5) -> list[dict] | None:
-    """Fetch similar customers from MySQL. Returns None if table not available."""
+    """Return Top-K similar customers via in-memory KNN engine (cosine similarity over 8 features).
+
+    Falls back to the old single-dimension SQL lookup only if the engine is unavailable.
+    """
+    from service.flask.repositories import similarity_engine
+    try:
+        res = similarity_engine.query_similar(customer_id, k=k)
+        if res is not None:
+            return res
+    except Exception:
+        pass
+
+    # 引擎不可用时的兜底（保留旧的"按信用分差距排序"逻辑）
     conn = _connect(Settings.MYSQL_DB_ODS)
     try:
         with conn.cursor() as cur:

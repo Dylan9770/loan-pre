@@ -12,6 +12,8 @@ from flask import Blueprint, jsonify
 
 from service.flask.model_loader import predict_default, predict_fraud, predict_limit
 from service.flask.repositories.mysql_repo import (
+    compute_peer_percentile,
+    fetch_customer_credit_signals,
     fetch_customer_loan_facts,
     fetch_customer_profile,
     fetch_customer_similar,
@@ -98,139 +100,98 @@ def _build_mock_profile(customer_id: int) -> dict:
     return profile
 
 
-def _build_mock_timeline(customer_id: int) -> list[dict]:
-    """Generate realistic loan repayment timeline for demo (events up to today only)."""
-    from datetime import date
-    TODAY = date.today()
-    rng_seed = customer_id % 1000
+def _build_credit_profile(signals: dict | None, facts: dict | None) -> dict:
+    """Assemble the customer credit profile shown in place of the loan timeline.
 
-    # 贷款基本参数
-    principal   = 20000 + (rng_seed % 16) * 5000          # 20000~95000，步进5000
-    annual_rate = [4.9, 5.5, 6.0, 6.5, 7.0][rng_seed % 5]
-    term        = [12, 24, 36, 48][rng_seed % 4]           # 期数
-    monthly_rate = annual_rate / 100 / 12
+    Returns three sections:
+      - recent_activity: 4 raw counters from customer_features (近6月新增/违约, 征信查询, 信用历史)
+      - finance_health:  3 ratios (额度使用率, 还款进度, 杠杆率) clamped to 0~1 for ring display
+      - peer_percentile: 4 indicators with percentile ranks vs. the whole customer base
 
-    # 等额还款月供公式
-    if monthly_rate > 0:
-        monthly_payment = principal * monthly_rate * (1 + monthly_rate) ** term \
-                          / ((1 + monthly_rate) ** term - 1)
-    else:
-        monthly_payment = principal / term
-    monthly_payment = round(monthly_payment)
+    Either input may be None (eg. customer missing from one table); fields fall back to 0/None.
+    """
+    s = signals or {}
+    f = facts or {}
 
-    # 逾期期数（0~2次，高风险客户更多）
-    overdue_months = set()
-    if rng_seed % 7 == 0:          # 约14%客户有逾期
-        overdue_months.add(rng_seed % (term // 2) + 2)
-    if rng_seed % 15 == 0:         # 约7%有两次逾期
-        overdue_months.add(rng_seed % term + 1)
+    # Numbers fall through several sources because the two tables overlap partially.
+    def _num(*keys, default=0):
+        for k in keys:
+            for src in (s, f):
+                v = src.get(k)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        continue
+        return default
 
-    # 申请和放款日期：确保贷款开始时间在今天之前至少 3 个月
-    apply_year  = 2023 if rng_seed % 3 == 0 else 2024
-    apply_month = 1 + (rng_seed % 10)       # 1~10月申请
-    apply_day   = 5 + (rng_seed % 10)
+    new_6m       = int(_num("last_six_month_new_loan_no"))
+    default_6m   = int(_num("last_six_month_defaulted_no"))
+    enquiries    = int(_num("enquirie_no"))
+    # credit_history 源 CSV 单位为"月"，直接用月展示（按年会大量出现 0 年）
+    credit_hist_months = int(_num("credit_history"))
 
-    def fmt_date(y, m, d):
-        m = ((m - 1) % 12) + 1
-        y_adj = y + (apply_month + (m - apply_month) - 1) // 12
-        return f"{y_adj}-{m:02d}-{min(d, 28):02d}"
+    asset_cost   = _num("asset_cost")
+    monthly_pay_gauge = _num("total_monthly_payment")
+    ltv          = _num("loan_to_asset_ratio", "ltv_ratio")
 
-    events = [
-        {
-            "date": fmt_date(apply_year, apply_month, apply_day),
-            "type": "loan-apply",
-            "title": "提交贷款申请",
-            "detail": f"申请金额: {principal:,}元, 用途: 购车",
-        },
-        {
-            "date": fmt_date(apply_year, apply_month, apply_day + 10),
-            "type": "loan-disbursed",
-            "title": "贷款发放",
-            "detail": f"实际发放: {principal:,}元, 年利率: {annual_rate}%, 期限: {term}期, 月供: {monthly_payment:,}元",
-        },
+
+    # Peer percentile: positive metrics use the raw percentile;
+    # negative metrics ("lower is better") flip to 100 - pctl so the bar always
+    # reads as "better than X% of customers".
+    def _pctl(metric: str, value, lower_is_better: bool = False):
+        raw = compute_peer_percentile(value, metric)
+        if raw is None:
+            return None
+        return round(100.0 - raw, 1) if lower_is_better else raw
+
+    credit_score = _num("credit_score")
+    overdue_no   = _num("total_overdue_no")
+    monthly_pay  = _num("total_monthly_payment")
+
+    peer = [
+        {"label": "信用评分",  "value": round(credit_score, 0),
+         "percentile": _pctl("credit_score", credit_score)},
+        {"label": "逾期次数",  "value": int(overdue_no),
+         "percentile": _pctl("total_overdue_no", overdue_no, lower_is_better=True)},
+        {"label": "月供负担",  "value": round(monthly_pay, 0),
+         "percentile": _pctl("total_monthly_payment", monthly_pay, lower_is_better=True)},
+        {"label": "杠杆率(LTV)", "value": round(ltv, 3),
+         "percentile": _pctl("loan_to_asset_ratio", ltv, lower_is_better=True)},
     ]
 
-    # 还款记录：从放款下一个月开始
-    balance = principal
-    repay_month = apply_month + 1
-    repay_year  = apply_year
-    completed   = False
+    return {
+        "recent_activity": [
+            {"label": "近6月新增贷款", "value": new_6m,      "unit": "笔",
+             "tone": "danger" if new_6m >= 5 else ("warn" if new_6m >= 2 else "ok")},
+            {"label": "近6月违约",     "value": default_6m,  "unit": "次",
+             "tone": "danger" if default_6m >= 1 else "ok"},
+            {"label": "征信查询次数", "value": enquiries,   "unit": "次",
+             "tone": "danger" if enquiries >= 8 else ("warn" if enquiries >= 4 else "ok")},
+            {"label": "信用历史",     "value": credit_hist_months, "unit": "月",
+             "tone": "ok" if credit_hist_months >= 36 else ("warn" if credit_hist_months >= 12 else "danger")},
+        ],
+        "finance_health": {
+            "asset_cost": {
+                "label": "资产成本（车价）", "value": round(asset_cost, 0),
+                "unit": "元", "max": 200000,
+                "bands": {"ok": [0, 80000], "warn": [80000, 150000], "danger": [150000, 200000]},
+            },
+            "monthly_payment": {
+                "label": "月供负担", "value": round(monthly_pay_gauge, 0),
+                "unit": "元", "max": 50000,
+                "bands": {"ok": [0, 15000], "warn": [15000, 30000], "danger": [30000, 50000]},
+            },
+            "ltv": {
+                "label": "杠杆率(LTV)", "value": round(ltv, 3),
+                "unit": "", "max": 1.2,
+                "bands": {"ok": [0.5, 0.75], "warn_low": [0.3, 0.5], "warn_high": [0.75, 1.0],
+                          "danger_low": [0, 0.3], "danger_high": [1.0, 1.2]},
+            },
+        },
+        "peer_percentile": peer,
+    }
 
-    for period in range(1, term + 1):
-        if repay_month > 12:
-            repay_month -= 12
-            repay_year  += 1
-
-        repay_day = apply_day + 10  # 每月固定还款日
-
-        # 计算本期利息和本金
-        interest   = round(balance * monthly_rate)
-        principal_part = monthly_payment - interest
-        balance    = max(0, balance - principal_part)
-
-        # 该期还款日期
-        event_date_str = fmt_date(repay_year, repay_month, repay_day)
-        try:
-            event_date = date.fromisoformat(event_date_str)
-        except ValueError:
-            event_date = TODAY  # 容错
-
-        # 只记录今天及之前已发生的事件
-        if event_date > TODAY:
-            break
-
-        if period in overdue_months:
-            overdue_days = 3 + rng_seed % 12
-            penalty      = round(monthly_payment * 0.0005 * overdue_days)
-            events.append({
-                "date": fmt_date(repay_year, repay_month, repay_day + overdue_days),
-                "type": "overdue",
-                "title": f"逾期还款（第{period}期）",
-                "detail": f"逾期{overdue_days}天, 本期还款: {monthly_payment:,}元, 罚息: {penalty}元, 已补缴",
-            })
-        else:
-            events.append({
-                "date": event_date_str,
-                "type": "ontime-repay",
-                "title": f"按时还款（第{period}期）",
-                "detail": f"本期还款: {monthly_payment:,}元, 其中利息: {interest}元, 剩余本金: {balance:,}元",
-            })
-
-        repay_month += 1
-
-        # 提前结清（约20%客户在最后6期内提前结清，且结清日在今天之前）
-        early_close_period = term - (rng_seed % 6)
-        if period == early_close_period and rng_seed % 5 == 0 and balance > 0:
-            close_date_str = fmt_date(repay_year, repay_month, repay_day)
-            try:
-                close_date = date.fromisoformat(close_date_str)
-            except ValueError:
-                close_date = TODAY
-            if close_date <= TODAY:
-                events.append({
-                    "date": close_date_str,
-                    "type": "closed",
-                    "title": "提前结清",
-                    "detail": f"提前偿还剩余本金: {balance:,}元, 结清证明已生成",
-                })
-                completed = True
-            break
-
-    if not completed and period == term:
-        final_date_str = fmt_date(repay_year, repay_month, apply_day + 10)
-        try:
-            final_date = date.fromisoformat(final_date_str)
-        except ValueError:
-            final_date = TODAY
-        if final_date <= TODAY:
-            events.append({
-                "date": final_date_str,
-                "type": "closed",
-                "title": "贷款结清",
-                "detail": "全部本息已还清, 结清证明已生成",
-            })
-
-    return events
 
 
 @customer_bp.get("/random_id")
@@ -364,177 +325,26 @@ def get_similar_customers(customer_id: int):
     return jsonify(similar)
 
 
-def _build_timeline_from_facts(customer_id: int, facts: dict) -> list[dict]:
-    """Build a loan timeline using real loan_fact fields.
+@customer_bp.get("/<int:customer_id>/credit_profile")
+def get_customer_credit_profile(customer_id: int):
+    """Customer credit profile shown in place of the legacy loan timeline.
 
-    Real fields: disbursed_amount, total_monthly_payment, total_overdue_no, loan_default.
-    Constructed (CSV lacks month/day & per-installment data): apply day, repayment day,
-    which installments are overdue, period length when monthly_payment is missing/invalid.
+    Returns three sections (see `_build_credit_profile`):
+      - recent_activity (4 数字卡)
+      - finance_health  (3 圆环)
+      - peer_percentile (4 同业百分位)
+
+    数据全部来自 customer_features + loan_fact，无 mock 构造。
     """
-    from datetime import date
-    TODAY = date.today()
-    rng_seed = customer_id % 1000
-
-    principal = float(facts.get("disbursed_amount") or 0)
-    monthly_payment_raw = float(facts.get("total_monthly_payment") or 0)
-    overdue_no = int(facts.get("total_overdue_no") or 0)
-    defaulted = int(facts.get("loan_default") or 0)
-    disbursed_year = str(facts.get("disbursed_date") or "2019")[:4]
-    try:
-        apply_year = int(disbursed_year)
-    except ValueError:
-        apply_year = 2019
-
-    if principal <= 0:
-        principal = 20000 + (rng_seed % 16) * 5000
-
-    # 月供异常时（缺失或超过本金的 1/3，明显是数据噪声）按等额本息回算
-    annual_rate = [4.9, 5.5, 6.0, 6.5, 7.0][rng_seed % 5]
-    term = [12, 24, 36, 48][rng_seed % 4]
-    monthly_rate = annual_rate / 100 / 12
-
-    if monthly_payment_raw <= 0 or monthly_payment_raw > principal / 3:
-        if monthly_rate > 0:
-            monthly_payment = principal * monthly_rate * (1 + monthly_rate) ** term \
-                              / ((1 + monthly_rate) ** term - 1)
-        else:
-            monthly_payment = principal / term
-        monthly_payment = round(monthly_payment)
-    else:
-        monthly_payment = round(monthly_payment_raw)
-        # 用真实月供反推期数
-        if monthly_payment > monthly_rate * principal:
-            est_term = principal / (monthly_payment - monthly_rate * principal) if monthly_rate > 0 else principal / monthly_payment
-            est_term = int(min(60, max(6, est_term)))
-            term = est_term
-
-    apply_month = 1 + (rng_seed % 10)
-    apply_day = 5 + (rng_seed % 10)
-
-    # 把真实的 total_overdue_no 分布到不同期数上
-    overdue_months = set()
-    if overdue_no > 0:
-        for k in range(min(overdue_no, term - 1)):
-            slot = ((rng_seed * (k + 1)) % (term - 1)) + 1
-            overdue_months.add(slot)
-
-    def fmt_date(y, m, d):
-        m = ((m - 1) % 12) + 1
-        return f"{y}-{m:02d}-{min(d, 28):02d}"
-
-    events = [
-        {
-            "date": fmt_date(apply_year, apply_month, apply_day),
-            "type": "loan-apply",
-            "title": "提交贷款申请",
-            "detail": f"申请金额: {int(principal):,}元, 用途: 购车",
-        },
-        {
-            "date": fmt_date(apply_year, apply_month, apply_day + 10),
-            "type": "loan-disbursed",
-            "title": "贷款发放",
-            "detail": (
-                f"实际发放: {int(principal):,}元, 年利率: {annual_rate}%, "
-                f"期限: {term}期, 月供: {monthly_payment:,}元"
-            ),
-        },
-    ]
-
-    balance = principal
-    repay_month = apply_month + 1
-    repay_year = apply_year
-    completed = False
-    period = 0
-
-    for period in range(1, term + 1):
-        if repay_month > 12:
-            repay_month -= 12
-            repay_year += 1
-
-        repay_day = apply_day + 10
-        interest = round(balance * monthly_rate)
-        principal_part = monthly_payment - interest
-        balance = max(0, balance - principal_part)
-
-        event_date_str = fmt_date(repay_year, repay_month, repay_day)
-        try:
-            event_date = date.fromisoformat(event_date_str)
-        except ValueError:
-            event_date = TODAY
-
-        if event_date > TODAY:
-            break
-
-        if period in overdue_months:
-            overdue_days = 3 + (rng_seed + period) % 12
-            penalty = round(monthly_payment * 0.0005 * overdue_days)
-            events.append({
-                "date": fmt_date(repay_year, repay_month, repay_day + overdue_days),
-                "type": "overdue",
-                "title": f"逾期还款（第{period}期）",
-                "detail": (
-                    f"逾期{overdue_days}天, 本期应还: {monthly_payment:,}元, "
-                    f"罚息: {penalty}元, 已补缴"
-                ),
-            })
-        else:
-            events.append({
-                "date": event_date_str,
-                "type": "ontime-repay",
-                "title": f"按时还款（第{period}期）",
-                "detail": (
-                    f"本期还款: {monthly_payment:,}元, 利息: {interest}元, "
-                    f"剩余本金: {int(balance):,}元"
-                ),
-            })
-
-        repay_month += 1
-
-    # 如果违约标签 = 1，最后追加一条违约状态记录
-    if defaulted and events:
-        last_date = events[-1]["date"]
-        events.append({
-            "date": last_date,
-            "type": "overdue",
-            "title": "标记违约",
-            "detail": f"累计逾期 {overdue_no} 次，账户被标记为违约状态",
-        })
-    elif period == term and balance <= 1 and not defaulted:
-        final_date_str = fmt_date(repay_year, repay_month, apply_day + 10)
-        try:
-            final_date = date.fromisoformat(final_date_str)
-        except ValueError:
-            final_date = TODAY
-        if final_date <= TODAY:
-            events.append({
-                "date": final_date_str,
-                "type": "closed",
-                "title": "贷款结清",
-                "detail": "全部本息已还清, 结清证明已生成",
-            })
-            completed = True
-
-    return events
-
-
-@customer_bp.get("/<int:customer_id>/loan_history")
-def get_customer_loan_history(customer_id: int):
-    """Return loan behavior timeline for a customer.
-
-    数据策略：优先从 loan_fact 读取真实金额/月供/逾期次数/违约标签，
-    其余（月份分配、具体逾期期数）按 customer_id 派生稳定构造。
-    没有真实数据时退化为完全 mock。
-    """
-    facts = fetch_customer_loan_facts(customer_id)
-    if facts:
-        timeline = _build_timeline_from_facts(customer_id, facts)
-        source = "loan_fact"
-    else:
-        timeline = _build_mock_timeline(customer_id)
-        source = "mock"
+    signals = fetch_customer_credit_signals(customer_id)
+    facts   = fetch_customer_loan_facts(customer_id)
+    if not signals and not facts:
+        return jsonify({
+            "error": "customer not found",
+            "customer_id": customer_id,
+        }), 404
+    profile = _build_credit_profile(signals, facts)
     return jsonify({
         "customer_id": customer_id,
-        "events": timeline,
-        "total_events": len(timeline),
-        "source": source,
+        **profile,
     })

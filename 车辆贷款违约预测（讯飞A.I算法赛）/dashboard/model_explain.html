@@ -190,35 +190,6 @@
       padding-left: 42px;
     }
 
-    /* Threshold slider */
-    .threshold-control {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      padding: 12px 16px;
-      background: #f5f7fa;
-      border-radius: var(--radius-sm);
-      margin-bottom: 16px;
-    }
-
-    .threshold-control label {
-      font-size: 13px;
-      font-weight: 500;
-      white-space: nowrap;
-    }
-
-    .threshold-control input[type="range"] {
-      flex: 1;
-      accent-color: var(--color-primary);
-    }
-
-    .threshold-value {
-      font-weight: 700;
-      color: var(--color-primary);
-      min-width: 50px;
-      text-align: right;
-    }
-
     /* Metric comparison bars */
     .metric-bar-row {
       display: flex;
@@ -285,14 +256,6 @@
         </div>
       </div>
 
-      <!-- Threshold Control -->
-      <div class="threshold-control">
-        <label>违约概率阈值调整:</label>
-        <input type="range" id="thresholdSlider" min="0.1" max="0.9" step="0.05" value="0.5" oninput="updateThreshold(this.value)" />
-        <span class="threshold-value" id="thresholdDisplay">0.50</span>
-        <span style="font-size:12px;color:var(--color-text-muted);">阈值越高，越严格拒绝高风险客户</span>
-      </div>
-
       <!-- Model Grid -->
       <div class="model-grid">
         <!-- Left Column -->
@@ -350,9 +313,19 @@
               </div>
             </div>
             <div class="card-body">
+              <div class="explain-toolbar" style="display:flex;gap:6px;margin-bottom:10px;">
+                <input id="explainCustomerInput" type="number" placeholder="输入客户ID 查看解释"
+                       style="flex:1;padding:6px 10px;border:1px solid #d0d4d8;border-radius:4px;font-size:12px;">
+                <button id="explainBtn" type="button"
+                        style="padding:6px 14px;background:#1a73e8;color:#fff;border:0;border-radius:4px;font-size:12px;cursor:pointer;">解释</button>
+                <button id="explainRandomBtn" type="button"
+                        style="padding:6px 14px;background:#fff;color:#5f6368;border:1px solid #d0d4d8;border-radius:4px;font-size:12px;cursor:pointer;">随机</button>
+              </div>
               <div id="chartShapWaterfall" class="chart-container" style="height:320px;"></div>
               <div class="shap-waterfall" id="shapWaterfallDetail">
-                <!-- Filled by JS -->
+                <div id="explainEmptyState" style="padding:30px 16px;text-align:center;color:#9aa0a6;font-size:12px;">
+                  请输入客户 ID 并点击"解释"，或点击"随机"抽取一名真实客户查看其预测解释
+                </div>
               </div>
             </div>
           </div>

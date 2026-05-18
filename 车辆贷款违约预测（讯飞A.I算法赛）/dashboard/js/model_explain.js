@@ -141,52 +141,76 @@ function renderModelCompareTable(comparison) {
   `;
 }
 
-/* ---------- SHAP Waterfall Chart（单客户解释） ---------- */
+/* ---------- SHAP Waterfall Chart（单客户解释） ----------
+ * 用 ECharts 标准堆叠瀑布图：透明占位条 + 着色增量条。
+ * 比 custom renderItem 更稳，y 轴自动聚焦在 base..final 范围。
+ */
 function renderShapWaterfall(sample) {
-  const chart = echarts.init(document.getElementById('chartShapWaterfall'));
-  if (!chart || !sample) return;
+  const dom = document.getElementById('chartShapWaterfall');
+  if (!dom || !sample) return;
+  // 复用已存在的 ECharts 实例，避免多次 init 残留
+  const chart = echarts.getInstanceByDom(dom) || echarts.init(dom);
 
-  // sample: { label, credit_score, p_default, base_value, items: [{display, value}] }
-  const items = sample.items;
-  const base  = sample.base_value;
+  const items = sample.items || [];
+  const base  = Number(sample.base_value) || 0;
 
-  let cumValue = base;
-  const waterfallData = [];
+  // 累积值序列：cum[0]=base, cum[i+1]=cum[i]+items[i].value
+  const cum = [base];
+  for (const it of items) cum.push(cum[cum.length - 1] + Number(it.value));
+  const finalVal = cum[cum.length - 1];
+
+  // 三组堆叠数据：placeholder（透明） + positive（升高） + negative（降低）
   const labels = ['Base'];
-  // base bar
-  waterfallData.push({ value: [0, 0, base, base], itemStyle: { color: '#6b7785' } });
+  const placeholders = [0];  // base 列从 0 起
+  const positives    = [base];  // base 用正向显示
+  const negatives    = [0];
 
-  items.forEach((item, i) => {
-    const idx = i + 1;
-    if (item.value >= 0) {
-      waterfallData.push({ value: [idx, cumValue, cumValue + item.value, item.value],
-                            itemStyle: { color: '#ea4335' } });
+  items.forEach((it, i) => {
+    const v = Number(it.value);
+    labels.push(it.display || it.name);
+    if (v >= 0) {
+      placeholders.push(cum[i]);
+      positives.push(v);
+      negatives.push(0);
     } else {
-      waterfallData.push({ value: [idx, cumValue + item.value, cumValue, item.value],
-                            itemStyle: { color: '#34a853' } });
+      // 负向：占位条到 cum[i+1]（更低点），负条向上回填到 cum[i]
+      placeholders.push(cum[i + 1]);
+      positives.push(0);
+      negatives.push(-v);
     }
-    cumValue += item.value;
-    labels.push(item.display || item.name);
   });
 
-  // Final prediction bar
-  waterfallData.push({ value: [items.length + 1, 0, cumValue, cumValue],
-                        itemStyle: { color: cumValue < 600 ? '#ea4335' : '#34a853' } });
-  labels.push(`预测=${cumValue.toFixed(0)}`);
+  // 最终列：从 0 到 finalVal 实心
+  labels.push(`预测=${finalVal.toFixed(0)}`);
+  placeholders.push(0);
+  positives.push(finalVal);
+  negatives.push(0);
+
+  // y 轴范围：紧贴数据（base ± 最大波动），方便看清增量
+  const allCum = cum.concat([base, finalVal]);
+  const yMin = Math.max(0, Math.floor(Math.min(...allCum) - 30));
+  const yMax = Math.ceil(Math.max(...allCum) + 30);
+
+  // base 列与 final 列用统一灰色；中间增量按 +/- 着色
+  const baseColor   = '#6b7785';
+  const finalColor  = finalVal < 600 ? '#ea4335' : '#34a853';
 
   chart.setOption({
     backgroundColor: 'transparent',
     tooltip: {
-      formatter: (p) => {
-        const i = p.dataIndex;
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params) => {
+        const i = params[0].dataIndex;
         if (i === 0) return `<b>Base value</b><br/>训练集平均评分: <b>${base.toFixed(1)}</b>`;
-        if (i === items.length + 1) return `<b>最终预测</b><br/>评分: <b>${cumValue.toFixed(1)}</b><br/>P(违约): <b>${sample.p_default}</b>`;
+        if (i === items.length + 1) return `<b>最终预测</b><br/>评分: <b>${finalVal.toFixed(1)}</b><br/>P(违约): <b>${(sample.p_default * 100).toFixed(1)}%</b>`;
         const it = items[i - 1];
         const sign = it.value >= 0 ? '+' : '';
-        return `<b>${it.display || it.name}</b><br/>SHAP贡献: <b style="color:${it.value >= 0 ? '#ea4335' : '#34a853'}">${sign}${it.value.toFixed(2)}</b>`;
+        const color = it.value >= 0 ? '#ea4335' : '#34a853';
+        return `<b>${it.display || it.name}</b><br/>SHAP贡献: <b style="color:${color}">${sign}${Number(it.value).toFixed(2)}</b><br/>累积评分: <b>${cum[i].toFixed(1)} → ${cum[i].toFixed(1) + (it.value >= 0 ? ' +' : ' ') + Number(it.value).toFixed(1)} = ${(cum[i] + it.value).toFixed(1)}</b>`;
       },
     },
-    grid: { top: 10, right: 60, bottom: 50, left: 60 },
+    grid: { top: 14, right: 24, bottom: 60, left: 50 },
     xAxis: {
       type: 'category',
       data: labels,
@@ -194,29 +218,33 @@ function renderShapWaterfall(sample) {
       axisLine: { lineStyle: { color: '#e0e4e8' } },
     },
     yAxis: {
-      type: 'value',
+      type: 'value', min: yMin, max: yMax,
       axisLabel: { fontSize: 10, formatter: (v) => v.toFixed(0), color: '#6b7785' },
       splitLine: { lineStyle: { color: '#f0f0f0' } },
     },
-    series: [{
-      type: 'custom',
-      renderItem: (params, api) => {
-        const val = api.value();
-        const i = val[0];
-        const start = api.coord([i, val[1]]);
-        const end = api.coord([i, val[2]]);
-        const height = Math.abs(end[1] - start[1]);
-        const y = Math.min(start[1], end[1]);
-        return {
-          type: 'rect',
-          shape: { x: start[0] - 18, y, width: 36, height: Math.max(2, height) },
-          style: api.style(),
-        };
+    series: [
+      {
+        name: '占位', type: 'bar', stack: 'wf', barWidth: 26,
+        data: placeholders,
+        itemStyle: { borderColor: 'transparent', color: 'transparent' },
+        emphasis: { itemStyle: { borderColor: 'transparent', color: 'transparent' } },
+        tooltip: { show: false },
       },
-      data: waterfallData,
-      encode: { x: 0, y: [1, 2] },
-    }],
+      {
+        name: '增加(变红)', type: 'bar', stack: 'wf', barWidth: 26,
+        data: positives.map((v, idx) => ({
+          value: v,
+          itemStyle: { color: idx === 0 ? baseColor : (idx === labels.length - 1 ? finalColor : '#ea4335') },
+        })),
+      },
+      {
+        name: '降低(变绿)', type: 'bar', stack: 'wf', barWidth: 26,
+        data: negatives,
+        itemStyle: { color: '#34a853' },
+      },
+    ],
   });
+  chart.resize();
 }
 
 /* ---------- SHAP Waterfall 详情列表 ---------- */
@@ -314,22 +342,14 @@ function renderDecisionCases(decisions) {
   }).join('');
 }
 
-/* ---------- 阈值调整（仅显示，未来可接 /predict 重算） ---------- */
-function updateThreshold(value) {
-  const el = document.getElementById('thresholdDisplay');
-  if (el) el.textContent = parseFloat(value).toFixed(2);
-}
-
 /* ---------- 页面初始化 ---------- */
 let resizeTimer;
-let _waterfallSamples = [];
 
 async function boot() {
-  // 并行拉所有真实数据
-  const [shapGlobal, comparison, samples, decisions] = await Promise.all([
+  // 并行拉全局解释 + 模型对比 + 决策案例（单客户解释改为按需触发）
+  const [shapGlobal, comparison, decisions] = await Promise.all([
     API.modelShapValues(),
     API.modelComparison(),
-    API.modelShapWaterfallSamples(),
     API.statsRecentDecisions(),
   ]);
 
@@ -347,50 +367,64 @@ async function boot() {
     console.warn('[ModelExplain] comparison unavailable:', comparison);
   }
 
-  if (Array.isArray(samples) && samples.length) {
-    _waterfallSamples = samples;
-    renderShapWaterfall(samples[0]);
-    renderShapWaterfallDetail(samples[0]);
-    _attachSampleSwitcher(samples);
-  } else {
-    console.warn('[ModelExplain] shap_samples unavailable:', samples);
-  }
-
+  _bindExplainToolbar();
   renderDecisionCases(Array.isArray(decisions) ? decisions : []);
 
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       ['chartShapBar', 'chartModelCompare', 'chartShapWaterfall'].forEach(id => {
-        const inst = echarts.getInstanceByDom(document.getElementById(id));
+        const el = document.getElementById(id);
+        if (!el) return;
+        const inst = echarts.getInstanceByDom(el);
         if (inst) inst.resize();
       });
     }, 300);
   });
 }
 
-/* 在 Waterfall 卡片上加"低/中/高风险样本"切换按钮 */
-function _attachSampleSwitcher(samples) {
-  const detailEl = document.getElementById('shapWaterfallDetail');
-  if (!detailEl) return;
-  const switcher = document.createElement('div');
-  switcher.style.cssText = 'display:flex;gap:6px;margin-bottom:8px;';
-  samples.forEach((s, i) => {
-    const btn = document.createElement('button');
-    btn.textContent = s.label;
-    btn.style.cssText = `flex:1;padding:6px;font-size:11px;border:1px solid #d0d4d8;border-radius:4px;cursor:pointer;background:${i === 0 ? '#1a73e8' : '#fff'};color:${i === 0 ? '#fff' : '#5f6368'};`;
-    btn.onclick = () => {
-      switcher.querySelectorAll('button').forEach((b, j) => {
-        b.style.background = (i === j) ? '#1a73e8' : '#fff';
-        b.style.color      = (i === j) ? '#fff' : '#5f6368';
-      });
-      renderShapWaterfall(samples[i]);
-      renderShapWaterfallDetail(samples[i]);
-    };
-    switcher.appendChild(btn);
+/* ---------- 单客户解释 工具栏 ---------- */
+function _bindExplainToolbar() {
+  const input = document.getElementById('explainCustomerInput');
+  const btn = document.getElementById('explainBtn');
+  const randomBtn = document.getElementById('explainRandomBtn');
+  if (!input || !btn) return;
+
+  btn.onclick = () => {
+    const id = parseInt(input.value || '0', 10);
+    if (!id) { alert('请输入有效的客户ID'); return; }
+    explainCustomer(id);
+  };
+  input.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') btn.click();
   });
-  // 插入到详情列表上方
-  detailEl.parentElement.insertBefore(switcher, detailEl);
+  if (randomBtn) {
+    randomBtn.onclick = async () => {
+      const resp = await API.customerRandomId().catch(() => null);
+      const id = resp && resp.customer_id;
+      if (!id) { alert('无法从数据库获取随机客户'); return; }
+      input.value = id;
+      explainCustomer(id);
+    };
+  }
+}
+
+async function explainCustomer(customerId) {
+  const empty = document.getElementById('explainEmptyState');
+  const detailEl = document.getElementById('shapWaterfallDetail');
+  if (empty) empty.style.display = 'none';
+  if (detailEl) detailEl.innerHTML = '<div style="padding:20px;text-align:center;color:#9aa0a6;font-size:12px;">正在计算 SHAP 解释...</div>';
+
+  const sample = await API.modelExplainCustomer(customerId).catch(() => null);
+  if (!sample || sample.error || !Array.isArray(sample.items)) {
+    if (detailEl) detailEl.innerHTML = `<div style="padding:20px;text-align:center;color:#ea4335;font-size:12px;">解释失败：${(sample && sample.error) || '客户不存在或服务异常'}</div>`;
+    // 清空 waterfall 图
+    const chart = echarts.getInstanceByDom(document.getElementById('chartShapWaterfall'));
+    if (chart) chart.clear();
+    return;
+  }
+  renderShapWaterfall(sample);
+  renderShapWaterfallDetail(sample);
 }
 
 /* ---------- 启动 ---------- */
